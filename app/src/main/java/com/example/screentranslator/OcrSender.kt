@@ -19,16 +19,26 @@ class OcrSender(private val pcUrl: String) {
 
     private val jsonMediaType = "application/json; charset=utf-8".toMediaType()
 
-    fun send(result: OcrResult, frameW: Int, frameH: Int) {
+    fun send(
+        result: OcrResult,
+        frameW: Int,
+        frameH: Int,
+        mode: String = "translate",
+        overlayAlpha: Int = 217
+    ) {
         try {
             val root = JSONObject()
             root.put("frame_width", frameW)
             root.put("frame_height", frameH)
+            root.put("mode", mode)
+            root.put("overlay_alpha", overlayAlpha)
 
             val blocksArr = JSONArray()
             for (block in result.blocks) {
                 val r = block.boundingBox
                 if (r.width() <= 0 || r.height() <= 0) continue
+
+                val ir = block.initialBoundingBox
 
                 val obj = JSONObject()
                 obj.put("text", block.text)
@@ -37,6 +47,10 @@ class OcrSender(private val pcUrl: String) {
                 obj.put("w", r.width())
                 obj.put("h", r.height())
                 obj.put("confidence", block.confidence.toDouble())
+                obj.put("initial_x", ir.left)
+                obj.put("initial_y", ir.top)
+                obj.put("initial_w", ir.width())
+                obj.put("initial_h", ir.height())
                 blocksArr.put(obj)
             }
             root.put("blocks", blocksArr)

@@ -17,5 +17,6 @@ data class OcrResult(
 data class OcrBlock(
     val text: String,
     val boundingBox: Rect,
-    val confidence: Float = 0f
+    val confidence: Float = 0f,
+    val initialBoundingBox: Rect = boundingBox
 )

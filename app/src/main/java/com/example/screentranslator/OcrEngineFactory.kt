@@ -9,6 +9,6 @@ enum class OcrType(val displayName: String) {
 
 object OcrEngineFactory {
     fun create(context: Context, type: OcrType): OcrEngine = when (type) {
-        OcrType.ML_KIT -> MlKitOcrEngine()
+        OcrType.ML_KIT -> MlKitOcrEngine(context)
     }
 }

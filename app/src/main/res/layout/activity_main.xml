@@ -13,7 +13,7 @@
         <TextView
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:text="OCR-движок: ML Kit"
+            android:text="OCR-движок: ML Kit (2-pass)"
             android:textSize="20sp"
             android:layout_marginBottom="24dp"
             android:layout_gravity="center_horizontal" />
@@ -41,6 +41,82 @@
             android:layout_marginTop="4dp"
             android:max="100"
             android:progress="42" />
+
+        <TextView
+            android:id="@+id/textOcrPaddingValue"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="16dp"
+            android:text="Отступ OCR: 10%"
+            android:textSize="14sp"
+            android:gravity="center" />
+
+        <SeekBar
+            android:id="@+id/seekOcrPadding"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:max="50"
+            android:progress="10" />
+
+        <TextView
+            android:id="@+id/textOverlayAlphaValue"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="16dp"
+            android:text="Прозрачность фона перевода: 85%"
+            android:textSize="14sp"
+            android:gravity="center" />
+
+        <SeekBar
+            android:id="@+id/seekOverlayAlpha"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:max="100"
+            android:progress="85" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="16dp"
+            android:text="Исходный язык:"
+            android:textSize="14sp" />
+
+        <Spinner
+            android:id="@+id/spinnerSourceLang"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="16dp"
+            android:text="Язык перевода:"
+            android:textSize="14sp" />
+
+        <Spinner
+            android:id="@+id/spinnerTargetLang"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp" />
+
+        <TextView
+            android:id="@+id/textModelStatus"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:text="Модель перевода: проверка…"
+            android:textSize="13sp"
+            android:textColor="#666666" />
+
+        <Button
+            android:id="@+id/btnDownloadModel"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:text="⬇ Скачать модель перевода" />
 
         <Button
             android:id="@+id/btnStart"

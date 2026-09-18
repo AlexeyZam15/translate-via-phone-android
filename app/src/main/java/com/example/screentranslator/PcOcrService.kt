@@ -5,6 +5,7 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.Service
 import android.content.Intent
+import android.content.SharedPreferences
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.os.Build
@@ -19,27 +20,30 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import java.util.concurrent.atomic.AtomicBoolean
 
-class PcOcrService : Service() {
+class PcOcrService : Service(), SharedPreferences.OnSharedPreferenceChangeListener {
 
     private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
     private var mjpegReader: MJPEGReader? = null
     private var ocrEngine: OcrEngine? = null
     private var sender: OcrSender? = null
+    private var translator: OcrTranslator? = null
 
     private val isProcessing = AtomicBoolean(false)
 
     private var engineType: OcrType = OcrType.ML_KIT
     private var confidenceThreshold: Float = 0f
+    private var sourceLang: String? = null
+    private var targetLang: String = "ru"
+    private var debugMode: Boolean = false
+    private var overlayAlpha: Int = 217
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val engineName = intent?.getStringExtra(EXTRA_ENGINE) ?: OcrType.ML_KIT.name
         engineType = runCatching { OcrType.valueOf(engineName) }.getOrDefault(OcrType.ML_KIT)
-        confidenceThreshold = intent?.getFloatExtra(EXTRA_CONFIDENCE_THRESHOLD, 0f) ?: 0f
 
-        // Адрес ПК определяется автоматически через adb reverse:
-        //   adb reverse tcp:5005 tcp:5005
-        //   adb reverse tcp:5006 tcp:5006
-        // Тогда localhost на телефоне указывает на localhost на ПК.
+        loadSettings()
+        Settings.prefs(this).registerOnSharedPreferenceChangeListener(this)
+
         val mjpegUrl = "http://localhost:5005/stream"
         val ocrUrl = "http://localhost:5006/ocr"
 
@@ -47,19 +51,41 @@ class PcOcrService : Service() {
 
         ocrEngine = OcrEngineFactory.create(this, engineType)
         sender = OcrSender(ocrUrl)
+        translator = OcrTranslator(targetLang, sourceLang)
 
-        mjpegReader = MJPEGReader(mjpegUrl) { jpegBytes ->
-            onFrame(jpegBytes)
-        }
+        scope.launch { translator?.prepare() }
+
+        mjpegReader = MJPEGReader(mjpegUrl) { jpegBytes -> onFrame(jpegBytes) }
         mjpegReader?.start()
 
-        Log.d(TAG, "PcOcrService started: $mjpegUrl → $ocrUrl (threshold=$confidenceThreshold)")
+        Log.d(TAG, "PcOcrService started: threshold=$confidenceThreshold, " +
+                "source=${sourceLang ?: "auto"}, target=$targetLang, " +
+                "debug=$debugMode, alpha=$overlayAlpha")
 
         return START_NOT_STICKY
     }
 
+    private fun loadSettings() {
+        debugMode = Settings.isDebug(this)
+        confidenceThreshold = Settings.getConfidence(this) / 100f
+        val srcRaw = Settings.getSourceLang(this)
+        sourceLang = if (srcRaw.isEmpty()) null else srcRaw
+        targetLang = Settings.getTargetLang(this)
+        overlayAlpha = Settings.alphaFromPercent(Settings.getOverlayAlpha(this))
+    }
+
+    override fun onSharedPreferenceChanged(prefs: SharedPreferences?, key: String?) {
+        loadSettings()
+        if (key == Settings.KEY_SOURCE_LANG || key == Settings.KEY_TARGET_LANG) {
+            scope.launch {
+                translator?.close()
+                translator = OcrTranslator(targetLang, sourceLang)
+                translator?.prepare()
+            }
+        }
+    }
+
     private fun onFrame(jpegBytes: ByteArray) {
-        // Пропускаем кадр, если предыдущий ещё обрабатывается
         if (!isProcessing.compareAndSet(false, true)) return
 
         scope.launch {
@@ -85,20 +111,40 @@ class PcOcrService : Service() {
 
                 bitmap.recycle()
 
-                if (result != null && result.blocks.isNotEmpty()) {
-                    val filtered = if (confidenceThreshold > 0f) {
-                        result.blocks.filter { it.confidence >= confidenceThreshold }
-                    } else {
-                        result.blocks
-                    }
-                    if (filtered.isNotEmpty()) {
-                        sender?.send(OcrResult(result.text, filtered), fw, fh)
-                    }
+                if (result == null || result.blocks.isEmpty()) return@launch
+
+                val filtered = if (debugMode) {
+                    result.blocks
+                } else if (confidenceThreshold > 0f) {
+                    result.blocks.filter { it.confidence >= confidenceThreshold }
+                } else {
+                    result.blocks
+                }
+
+                if (filtered.isEmpty()) return@launch
+
+                val mode = if (debugMode) "debug" else "translate"
+
+                if (debugMode || translator?.isReady() != true) {
+                    sender?.send(OcrResult(result.text, filtered), fw, fh, mode, overlayAlpha)
+                    return@launch
+                }
+
+                val translated = translator?.translateAll(filtered.map { it.text })
+                    ?: emptyList()
+                val map = translated.toMap()
+                val outBlocks = filtered.mapNotNull { block ->
+                    val t = map[block.text] ?: return@mapNotNull null
+                    block.copy(text = t)
+                }
+
+                if (outBlocks.isNotEmpty()) {
+                    sender?.send(OcrResult(result.text, outBlocks), fw, fh, mode, overlayAlpha)
                 }
             } catch (e: Exception) {
                 Log.e(TAG, "onFrame error", e)
             } finally {
-                delay(100)
+                delay(50)
                 isProcessing.set(false)
             }
         }
@@ -108,27 +154,31 @@ class PcOcrService : Service() {
         val channelId = "pc_ocr"
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val channel = NotificationChannel(
-                channelId,
-                "PC OCR",
-                NotificationManager.IMPORTANCE_LOW
+                channelId, "PC OCR", NotificationManager.IMPORTANCE_LOW
             )
             (getSystemService(NOTIFICATION_SERVICE) as NotificationManager)
                 .createNotificationChannel(channel)
         }
+        val mode = if (debugMode) "debug" else "translate"
         return NotificationCompat.Builder(this, channelId)
             .setContentTitle("ScreenTranslator")
-            .setContentText("OCR ПК активен (localhost через ADB)")
+            .setContentText("OCR ПК активен ($mode, localhost через ADB)")
             .setSmallIcon(android.R.drawable.ic_menu_search)
             .setOngoing(true)
             .build()
     }
 
     override fun onDestroy() {
+        try {
+            Settings.prefs(this).unregisterOnSharedPreferenceChangeListener(this)
+        } catch (_: Exception) {}
         mjpegReader?.stop()
         mjpegReader = null
         ocrEngine?.close()
         ocrEngine = null
         sender = null
+        translator?.close()
+        translator = null
         scope.coroutineContext[Job]?.cancel()
         super.onDestroy()
         Log.d(TAG, "PcOcrService stopped")
@@ -140,6 +190,5 @@ class PcOcrService : Service() {
         private const val TAG = "PcOcrService"
         private const val NOTIFICATION_ID = 2
         const val EXTRA_ENGINE = "engine"
-        const val EXTRA_CONFIDENCE_THRESHOLD = "confidence_threshold"
     }
 }

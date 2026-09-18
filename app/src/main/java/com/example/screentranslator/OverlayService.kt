@@ -4,7 +4,9 @@ import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.Service
+import android.content.Context
 import android.content.Intent
+import android.content.SharedPreferences
 import android.graphics.Bitmap
 import android.graphics.PixelFormat
 import android.media.projection.MediaProjection
@@ -26,13 +28,14 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlin.math.abs
 
-class OverlayService : Service() {
+class OverlayService : Service(), SharedPreferences.OnSharedPreferenceChangeListener {
 
     private lateinit var windowManager: WindowManager
     private lateinit var floatingView: View
     private var zoneOverlay: ZoneOverlayView? = null
     private var captureHelper: ScreenCaptureHelper? = null
     private var ocrEngine: OcrEngine? = null
+    private var translator: OcrTranslator? = null
 
     private var ocrType: OcrType = OcrType.ML_KIT
     private var zonesVisible = false
@@ -40,6 +43,9 @@ class OverlayService : Service() {
 
     private var debugMode: Boolean = false
     private var confidenceThreshold: Float = 0f
+    private var sourceLang: String? = null
+    private var targetLang: String = "ru"
+    private var overlayAlpha: Int = 217  // 85% от 255
 
     private val serviceScope = CoroutineScope(Dispatchers.Main + Job())
 
@@ -48,8 +54,11 @@ class OverlayService : Service() {
             ?.let { runCatching { OcrType.valueOf(it) }.getOrNull() }
             ?: OcrType.ML_KIT
 
-        debugMode = intent?.getBooleanExtra(EXTRA_DEBUG, false) ?: false
-        confidenceThreshold = intent?.getFloatExtra(EXTRA_CONFIDENCE_THRESHOLD, 0f) ?: 0f
+        // Читаем настройки из SharedPreferences
+        loadSettings()
+
+        // Регистрируем listener для real-time изменений
+        Settings.prefs(this).registerOnSharedPreferenceChangeListener(this)
 
         val resultCode = intent?.getIntExtra(EXTRA_RESULT_CODE, 0) ?: 0
         val resultData: Intent? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
@@ -71,6 +80,28 @@ class OverlayService : Service() {
         return START_NOT_STICKY
     }
 
+    private fun loadSettings() {
+        debugMode = Settings.isDebug(this)
+        confidenceThreshold = Settings.getConfidence(this) / 100f
+        val srcRaw = Settings.getSourceLang(this)
+        sourceLang = if (srcRaw.isEmpty()) null else srcRaw
+        targetLang = Settings.getTargetLang(this)
+        overlayAlpha = Settings.alphaFromPercent(Settings.getOverlayAlpha(this))
+        Log.d(TAG, "Settings loaded: debug=$debugMode, conf=$confidenceThreshold, " +
+                "source=${sourceLang ?: "auto"}, target=$targetLang, alpha=$overlayAlpha")
+    }
+
+    override fun onSharedPreferenceChanged(prefs: SharedPreferences?, key: String?) {
+        Log.d(TAG, "Preference changed: $key")
+        loadSettings()
+        // Обновляем оверлей, если он виден
+        serviceScope.launch {
+            if (zonesVisible) {
+                runOcrAndShow()
+            }
+        }
+    }
+
     private fun initProjection(resultCode: Int, resultData: Intent) {
         val mpm = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
         val projection: MediaProjection = mpm.getMediaProjection(resultCode, resultData)
@@ -85,6 +116,11 @@ class OverlayService : Service() {
         captureHelper = helper
 
         ocrEngine = OcrEngineFactory.create(this, ocrType)
+        translator = OcrTranslator(targetLang, sourceLang)
+
+        serviceScope.launch {
+            translator?.prepare()
+        }
 
         windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
         createFloatingIcon()
@@ -175,67 +211,84 @@ class OverlayService : Service() {
         isProcessing = true
 
         serviceScope.launch {
-            Log.d(TAG, "runOcrAndShow: start")
-
-            delay(250)
+            delay(200)
 
             val bitmap: Bitmap? = withContext(Dispatchers.Default) {
                 captureHelper?.capture()
             }
-
             if (bitmap == null) {
-                Log.e(TAG, "capture() returned null")
                 isProcessing = false
                 return@launch
             }
 
             val bmpW = bitmap.width
             val bmpH = bitmap.height
-            Log.d(TAG, "captured bitmap ${bmpW}x${bmpH}")
 
             val result = try {
                 withContext(Dispatchers.Default) {
                     ocrEngine?.recognize(bitmap)
                 }
             } catch (e: Exception) {
-                Log.e(TAG, "OCR error", e)
                 bitmap.recycle()
                 isProcessing = false
                 return@launch
             }
-
             bitmap.recycle()
 
             if (result == null || result.blocks.isEmpty()) {
-                Log.d(TAG, "OCR result empty")
                 isProcessing = false
                 return@launch
             }
 
-            val filtered = if (confidenceThreshold > 0f) {
+            val filtered = if (debugMode) {
+                result.blocks
+            } else if (confidenceThreshold > 0f) {
                 result.blocks.filter { it.confidence >= confidenceThreshold }
             } else {
                 result.blocks
             }
 
             if (filtered.isEmpty()) {
-                Log.d(TAG, "No blocks above threshold $confidenceThreshold")
                 isProcessing = false
                 return@launch
             }
 
-            Log.d(TAG, "OCR blocks: ${filtered.size}/${result.blocks.size} (threshold=$confidenceThreshold)")
-            showZones(filtered, bmpW, bmpH)
+            if (debugMode || translator?.isReady() != true) {
+                showZones(filtered, bmpW, bmpH,
+                    showConfidence = true, showTranslation = false)
+            } else {
+                val translated = withContext(Dispatchers.Default) {
+                    translator?.translateAll(filtered.map { it.text }) ?: emptyList()
+                }
+                val map = translated.toMap()
+                val translatedBlocks = filtered.mapNotNull { block ->
+                    val t = map[block.text] ?: return@mapNotNull null
+                    block.copy(text = t)
+                }
+
+                if (translatedBlocks.isEmpty()) {
+                    hideZones()
+                } else {
+                    showZones(translatedBlocks, bmpW, bmpH,
+                        showConfidence = false, showTranslation = true)
+                }
+            }
 
             isProcessing = false
         }
     }
 
-    private fun showZones(blocks: List<OcrBlock>, sourceW: Int, sourceH: Int) {
+    private fun showZones(
+        blocks: List<OcrBlock>,
+        sourceW: Int,
+        sourceH: Int,
+        showConfidence: Boolean,
+        showTranslation: Boolean
+    ) {
         hideZones()
 
         val view = ZoneOverlayView(this)
-        view.setBlocks(blocks, sourceW, sourceH, debugMode)
+        view.setBlocks(blocks, sourceW, sourceH, showConfidence, showTranslation, overlayAlpha)
 
         val params = WindowManager.LayoutParams(
             WindowManager.LayoutParams.MATCH_PARENT,
@@ -263,16 +316,19 @@ class OverlayService : Service() {
                 .createNotificationChannel(channel)
         }
 
-        val debugSuffix = if (debugMode) " | debug" else ""
+        val modeSuffix = if (debugMode) "debug" else "translate"
         return NotificationCompat.Builder(this, channelId)
             .setContentTitle("ScreenTranslator")
-            .setContentText("Активен: ${ocrType.displayName}$debugSuffix")
+            .setContentText("Активен: ${ocrType.displayName} | $modeSuffix")
             .setSmallIcon(android.R.drawable.ic_menu_search)
             .setOngoing(true)
             .build()
     }
 
     override fun onDestroy() {
+        try {
+            Settings.prefs(this).unregisterOnSharedPreferenceChangeListener(this)
+        } catch (_: Exception) {}
         try {
             if (::floatingView.isInitialized) windowManager.removeView(floatingView)
         } catch (_: Exception) {
@@ -282,6 +338,8 @@ class OverlayService : Service() {
         captureHelper = null
         ocrEngine?.close()
         ocrEngine = null
+        translator?.close()
+        translator = null
         serviceScope.coroutineContext[Job]?.cancel()
         super.onDestroy()
     }
@@ -293,8 +351,6 @@ class OverlayService : Service() {
         const val EXTRA_OCR_TYPE = "ocr_type"
         const val EXTRA_RESULT_CODE = "result_code"
         const val EXTRA_RESULT_DATA = "result_data"
-        const val EXTRA_DEBUG = "debug"
-        const val EXTRA_CONFIDENCE_THRESHOLD = "confidence_threshold"
         private const val NOTIFICATION_ID = 1
     }
 }
