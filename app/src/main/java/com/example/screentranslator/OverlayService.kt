@@ -45,19 +45,19 @@ class OverlayService : Service(), SharedPreferences.OnSharedPreferenceChangeList
     private var confidenceThreshold: Float = 0f
     private var sourceLang: String? = null
     private var targetLang: String = "ru"
-    private var overlayAlpha: Int = 217  // 85% от 255
+    private var overlayAlpha: Int = 217
 
     private val serviceScope = CoroutineScope(Dispatchers.Main + Job())
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        DebugTimingLogger.init(applicationContext)
+        DebugTimingLogger.logEvent("android.overlay_service_start")
+
         ocrType = intent?.getStringExtra(EXTRA_OCR_TYPE)
             ?.let { runCatching { OcrType.valueOf(it) }.getOrNull() }
             ?: OcrType.ML_KIT
 
-        // Читаем настройки из SharedPreferences
         loadSettings()
-
-        // Регистрируем listener для real-time изменений
         Settings.prefs(this).registerOnSharedPreferenceChangeListener(this)
 
         val resultCode = intent?.getIntExtra(EXTRA_RESULT_CODE, 0) ?: 0
@@ -74,6 +74,7 @@ class OverlayService : Service(), SharedPreferences.OnSharedPreferenceChangeList
             initProjection(resultCode, resultData)
         } else {
             Log.e(TAG, "MediaProjection resultData == null")
+            DebugTimingLogger.logEvent("android.overlay_service_no_projection")
             stopSelf()
         }
 
@@ -94,7 +95,6 @@ class OverlayService : Service(), SharedPreferences.OnSharedPreferenceChangeList
     override fun onSharedPreferenceChanged(prefs: SharedPreferences?, key: String?) {
         Log.d(TAG, "Preference changed: $key")
         loadSettings()
-        // Обновляем оверлей, если он виден
         serviceScope.launch {
             if (zonesVisible) {
                 runOcrAndShow()
@@ -103,88 +103,93 @@ class OverlayService : Service(), SharedPreferences.OnSharedPreferenceChangeList
     }
 
     private fun initProjection(resultCode: Int, resultData: Intent) {
-        val mpm = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-        val projection: MediaProjection = mpm.getMediaProjection(resultCode, resultData)
-            ?: run {
-                Log.e(TAG, "MediaProjection == null")
-                stopSelf()
-                return
+        DebugTimingLogger.timed("android.overlay_init_projection") {
+            val mpm = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+            val projection: MediaProjection = mpm.getMediaProjection(resultCode, resultData)
+                ?: run {
+                    Log.e(TAG, "MediaProjection == null")
+                    DebugTimingLogger.logEvent("android.overlay_projection_null")
+                    stopSelf()
+                    return
+                }
+
+            val helper = ScreenCaptureHelper(this)
+            helper.start(projection)
+            captureHelper = helper
+
+            ocrEngine = OcrEngineFactory.create(this, ocrType)
+            translator = OcrTranslator(this, targetLang, sourceLang)
+
+            serviceScope.launch {
+                translator?.prepare()
             }
 
-        val helper = ScreenCaptureHelper(this)
-        helper.start(projection)
-        captureHelper = helper
-
-        ocrEngine = OcrEngineFactory.create(this, ocrType)
-        translator = OcrTranslator(targetLang, sourceLang)
-
-        serviceScope.launch {
-            translator?.prepare()
+            windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
+            createFloatingIcon()
         }
-
-        windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
-        createFloatingIcon()
     }
 
     private fun createFloatingIcon() {
-        floatingView = LayoutInflater.from(this)
-            .inflate(R.layout.floating_icon, null)
+        DebugTimingLogger.timed("android.overlay_create_floating_icon") {
+            floatingView = LayoutInflater.from(this)
+                .inflate(R.layout.floating_icon, null)
 
-        val params = WindowManager.LayoutParams(
-            WindowManager.LayoutParams.WRAP_CONTENT,
-            WindowManager.LayoutParams.WRAP_CONTENT,
-            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
-            PixelFormat.TRANSLUCENT
-        ).apply {
-            gravity = Gravity.TOP or Gravity.START
-            x = 80
-            y = 200
-        }
+            val params = WindowManager.LayoutParams(
+                WindowManager.LayoutParams.WRAP_CONTENT,
+                WindowManager.LayoutParams.WRAP_CONTENT,
+                WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+                PixelFormat.TRANSLUCENT
+            ).apply {
+                gravity = Gravity.TOP or Gravity.START
+                x = 80
+                y = 200
+            }
 
-        var isDrag = false
-        var downTime = 0L
-        var downX = 0f
-        var downY = 0f
+            var isDrag = false
+            var downTime = 0L
+            var downX = 0f
+            var downY = 0f
 
-        floatingView.setOnTouchListener { _, event ->
-            when (event.action) {
-                MotionEvent.ACTION_DOWN -> {
-                    downTime = System.currentTimeMillis()
-                    downX = event.rawX
-                    downY = event.rawY
-                    isDrag = false
-                    true
-                }
-                MotionEvent.ACTION_MOVE -> {
-                    val dx = (event.rawX - downX).toInt()
-                    val dy = (event.rawY - downY).toInt()
-                    if (abs(dx) > 10 || abs(dy) > 10) {
-                        isDrag = true
-                        params.x += dx
-                        params.y += dy
+            floatingView.setOnTouchListener { _, event ->
+                when (event.action) {
+                    MotionEvent.ACTION_DOWN -> {
+                        downTime = System.currentTimeMillis()
                         downX = event.rawX
                         downY = event.rawY
-                        windowManager.updateViewLayout(floatingView, params)
+                        isDrag = false
+                        true
                     }
-                    true
-                }
-                MotionEvent.ACTION_UP -> {
-                    val elapsed = System.currentTimeMillis() - downTime
-                    if (!isDrag) {
-                        if (elapsed > 600) {
-                            runOcrAndShow()
-                        } else {
-                            toggleZones()
+                    MotionEvent.ACTION_MOVE -> {
+                        val dx = (event.rawX - downX).toInt()
+                        val dy = (event.rawY - downY).toInt()
+                        if (abs(dx) > 10 || abs(dy) > 10) {
+                            isDrag = true
+                            params.x += dx
+                            params.y += dy
+                            downX = event.rawX
+                            downY = event.rawY
+                            windowManager.updateViewLayout(floatingView, params)
                         }
+                        true
                     }
-                    true
+                    MotionEvent.ACTION_UP -> {
+                        val elapsed = System.currentTimeMillis() - downTime
+                        if (!isDrag) {
+                            if (elapsed > 600) {
+                                runOcrAndShow()
+                            } else {
+                                toggleZones()
+                            }
+                        }
+                        true
+                    }
+                    else -> false
                 }
-                else -> false
             }
-        }
 
-        windowManager.addView(floatingView, params)
+            windowManager.addView(floatingView, params)
+        }
     }
 
     private fun toggleZones() {
@@ -210,71 +215,94 @@ class OverlayService : Service(), SharedPreferences.OnSharedPreferenceChangeList
         if (isProcessing) return
         isProcessing = true
 
+        val tCycleStart = System.nanoTime()
         serviceScope.launch {
-            delay(200)
+            var blockCount = 0
+            try {
+                delay(200)
 
-            val bitmap: Bitmap? = withContext(Dispatchers.Default) {
-                captureHelper?.capture()
-            }
-            if (bitmap == null) {
-                isProcessing = false
-                return@launch
-            }
+                val bitmap: Bitmap? = DebugTimingLogger.timed("android.overlay_capture") {
+                    withContext(Dispatchers.Default) {
+                        captureHelper?.capture()
+                    }
+                }
+                if (bitmap == null) {
+                    return@launch
+                }
 
-            val bmpW = bitmap.width
-            val bmpH = bitmap.height
+                val bmpW = bitmap.width
+                val bmpH = bitmap.height
 
-            val result = try {
-                withContext(Dispatchers.Default) {
-                    ocrEngine?.recognize(bitmap)
+                val result = DebugTimingLogger.timed("android.overlay_recognize") {
+                    try {
+                        withContext(Dispatchers.Default) {
+                            ocrEngine?.recognize(bitmap)
+                        }
+                    } catch (e: Exception) {
+                        DebugTimingLogger.logEvent("android.overlay_recognize_error",
+                            mapOf("error" to e.message.orEmpty()))
+                        bitmap.recycle()
+                        null
+                    }
+                }
+                bitmap.recycle()
+
+                if (result == null || result.blocks.isEmpty()) {
+                    return@launch
+                }
+
+                val filtered = if (debugMode) {
+                    result.blocks
+                } else if (confidenceThreshold > 0f) {
+                    result.blocks.filter { it.confidence >= confidenceThreshold }
+                } else {
+                    result.blocks
+                }
+
+                if (filtered.isEmpty()) {
+                    return@launch
+                }
+
+                if (debugMode || translator?.isReady() != true) {
+                    blockCount = filtered.size
+                    DebugTimingLogger.timed("android.overlay_show_zones") {
+                        showZones(filtered, bmpW, bmpH,
+                            showConfidence = true, showTranslation = false)
+                    }
+                } else {
+                    val translated = DebugTimingLogger.timed("android.overlay_translate_all") {
+                        withContext(Dispatchers.Default) {
+                            translator?.translateAll(filtered.map { it.text }) ?: emptyList()
+                        }
+                    }
+                    val map = translated.toMap()
+                    val translatedBlocks = filtered.mapNotNull { block ->
+                        val t = map[block.text] ?: return@mapNotNull null
+                        block.copy(text = t)
+                    }
+
+                    blockCount = translatedBlocks.size
+
+                    if (translatedBlocks.isEmpty()) {
+                        hideZones()
+                    } else {
+                        DebugTimingLogger.timed("android.overlay_show_zones") {
+                            showZones(translatedBlocks, bmpW, bmpH,
+                                showConfidence = false, showTranslation = true)
+                        }
+                    }
                 }
             } catch (e: Exception) {
-                bitmap.recycle()
+                DebugTimingLogger.logEvent("android.overlay_cycle_error",
+                    mapOf("error" to e.message.orEmpty()))
+            } finally {
+                val ms = (System.nanoTime() - tCycleStart) / 1_000_000.0
+                DebugTimingLogger.logTiming(
+                    "android.overlay_cycle_total", ms,
+                    mapOf("blocks" to blockCount)
+                )
                 isProcessing = false
-                return@launch
             }
-            bitmap.recycle()
-
-            if (result == null || result.blocks.isEmpty()) {
-                isProcessing = false
-                return@launch
-            }
-
-            val filtered = if (debugMode) {
-                result.blocks
-            } else if (confidenceThreshold > 0f) {
-                result.blocks.filter { it.confidence >= confidenceThreshold }
-            } else {
-                result.blocks
-            }
-
-            if (filtered.isEmpty()) {
-                isProcessing = false
-                return@launch
-            }
-
-            if (debugMode || translator?.isReady() != true) {
-                showZones(filtered, bmpW, bmpH,
-                    showConfidence = true, showTranslation = false)
-            } else {
-                val translated = withContext(Dispatchers.Default) {
-                    translator?.translateAll(filtered.map { it.text }) ?: emptyList()
-                }
-                val map = translated.toMap()
-                val translatedBlocks = filtered.mapNotNull { block ->
-                    val t = map[block.text] ?: return@mapNotNull null
-                    block.copy(text = t)
-                }
-
-                if (translatedBlocks.isEmpty()) {
-                    hideZones()
-                } else {
-                    showZones(translatedBlocks, bmpW, bmpH,
-                        showConfidence = false, showTranslation = true)
-                }
-            }
-
-            isProcessing = false
         }
     }
 
@@ -326,6 +354,7 @@ class OverlayService : Service(), SharedPreferences.OnSharedPreferenceChangeList
     }
 
     override fun onDestroy() {
+        DebugTimingLogger.logEvent("android.overlay_service_stop")
         try {
             Settings.prefs(this).unregisterOnSharedPreferenceChangeListener(this)
         } catch (_: Exception) {}

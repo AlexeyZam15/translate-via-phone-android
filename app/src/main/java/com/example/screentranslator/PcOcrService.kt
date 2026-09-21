@@ -41,6 +41,10 @@ class PcOcrService : Service(), SharedPreferences.OnSharedPreferenceChangeListen
         val engineName = intent?.getStringExtra(EXTRA_ENGINE) ?: OcrType.ML_KIT.name
         engineType = runCatching { OcrType.valueOf(engineName) }.getOrDefault(OcrType.ML_KIT)
 
+        DebugTimingLogger.init(applicationContext)
+        DebugTimingLogger.logEvent("android.pc_ocr_service_start",
+            mapOf("engine" to engineType.name))
+
         loadSettings()
         Settings.prefs(this).registerOnSharedPreferenceChangeListener(this)
 
@@ -51,7 +55,7 @@ class PcOcrService : Service(), SharedPreferences.OnSharedPreferenceChangeListen
 
         ocrEngine = OcrEngineFactory.create(this, engineType)
         sender = OcrSender(ocrUrl)
-        translator = OcrTranslator(targetLang, sourceLang)
+        translator = OcrTranslator(this, targetLang, sourceLang)
 
         scope.launch { translator?.prepare() }
 
@@ -79,7 +83,7 @@ class PcOcrService : Service(), SharedPreferences.OnSharedPreferenceChangeListen
         if (key == Settings.KEY_SOURCE_LANG || key == Settings.KEY_TARGET_LANG) {
             scope.launch {
                 translator?.close()
-                translator = OcrTranslator(targetLang, sourceLang)
+                translator = OcrTranslator(this@PcOcrService, targetLang, sourceLang)
                 translator?.prepare()
             }
         }
@@ -88,13 +92,17 @@ class PcOcrService : Service(), SharedPreferences.OnSharedPreferenceChangeListen
     private fun onFrame(jpegBytes: ByteArray) {
         if (!isProcessing.compareAndSet(false, true)) return
 
+        val tCycleStart = System.nanoTime()
         scope.launch {
+            var blockCount = 0
+            var mode = "translate"
             try {
-                val bitmap: Bitmap? = BitmapFactory.decodeByteArray(
-                    jpegBytes, 0, jpegBytes.size
-                )
+                val bitmap: Bitmap? = DebugTimingLogger.timed("android.pc_ocr_decode") {
+                    BitmapFactory.decodeByteArray(jpegBytes, 0, jpegBytes.size)
+                }
                 if (bitmap == null) {
                     Log.w(TAG, "decode failed")
+                    DebugTimingLogger.logEvent("android.pc_ocr_decode_failed")
                     return@launch
                 }
 
@@ -102,11 +110,15 @@ class PcOcrService : Service(), SharedPreferences.OnSharedPreferenceChangeListen
                 val fh = bitmap.height
 
                 val engine = ocrEngine ?: return@launch
-                val result = try {
-                    engine.recognize(bitmap)
-                } catch (e: Exception) {
-                    Log.e(TAG, "ocr error", e)
-                    null
+                val result = DebugTimingLogger.timed("android.pc_ocr_recognize") {
+                    try {
+                        engine.recognize(bitmap)
+                    } catch (e: Exception) {
+                        Log.e(TAG, "ocr error", e)
+                        DebugTimingLogger.logEvent("android.pc_ocr_error",
+                            mapOf("error" to e.message.orEmpty()))
+                        null
+                    }
                 }
 
                 bitmap.recycle()
@@ -123,28 +135,44 @@ class PcOcrService : Service(), SharedPreferences.OnSharedPreferenceChangeListen
 
                 if (filtered.isEmpty()) return@launch
 
-                val mode = if (debugMode) "debug" else "translate"
+                mode = if (debugMode) "debug" else "translate"
 
                 if (debugMode || translator?.isReady() != true) {
-                    sender?.send(OcrResult(result.text, filtered), fw, fh, mode, overlayAlpha)
+                    blockCount = filtered.size
+                    DebugTimingLogger.timed("android.pc_ocr_send") {
+                        sender?.send(OcrResult(result.text, filtered), fw, fh, mode, overlayAlpha)
+                    }
                     return@launch
                 }
 
-                val translated = translator?.translateAll(filtered.map { it.text })
-                    ?: emptyList()
+                val translated = DebugTimingLogger.timed("android.pc_ocr_translate_all") {
+                    translator?.translateAll(filtered.map { it.text }) ?: emptyList()
+                }
                 val map = translated.toMap()
                 val outBlocks = filtered.mapNotNull { block ->
                     val t = map[block.text] ?: return@mapNotNull null
                     block.copy(text = t)
                 }
 
+                blockCount = outBlocks.size
+
                 if (outBlocks.isNotEmpty()) {
-                    sender?.send(OcrResult(result.text, outBlocks), fw, fh, mode, overlayAlpha)
+                    DebugTimingLogger.timed("android.pc_ocr_send") {
+                        sender?.send(OcrResult(result.text, outBlocks), fw, fh, mode, overlayAlpha)
+                    }
                 }
             } catch (e: Exception) {
                 Log.e(TAG, "onFrame error", e)
+                DebugTimingLogger.logEvent("android.pc_ocr_cycle_error",
+                    mapOf("error" to e.message.orEmpty()))
             } finally {
-                delay(50)
+                val ms = (System.nanoTime() - tCycleStart) / 1_000_000.0
+                DebugTimingLogger.logTiming(
+                    "android.pc_ocr_cycle_total", ms,
+                    mapOf("blocks" to blockCount, "mode" to mode,
+                        "jpeg_kb" to jpegBytes.size / 1024)
+                )
+                delay(100)
                 isProcessing.set(false)
             }
         }
@@ -169,6 +197,7 @@ class PcOcrService : Service(), SharedPreferences.OnSharedPreferenceChangeListen
     }
 
     override fun onDestroy() {
+        DebugTimingLogger.logEvent("android.pc_ocr_service_stop")
         try {
             Settings.prefs(this).unregisterOnSharedPreferenceChangeListener(this)
         } catch (_: Exception) {}

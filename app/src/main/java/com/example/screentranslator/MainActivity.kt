@@ -38,7 +38,6 @@ class MainActivity : AppCompatActivity() {
 
     private val modelManager by lazy { RemoteModelManager.getInstance() }
 
-    // Debounce
     private val uiHandler = Handler(Looper.getMainLooper())
     private var pendingAlphaSave: Runnable? = null
     private var pendingPaddingSave: Runnable? = null
@@ -104,6 +103,9 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
+        // --- Debug timing logger ---
+        DebugTimingLogger.init(applicationContext)
+
         checkDebug = findViewById(R.id.checkDebug)
         seekConfidence = findViewById(R.id.seekConfidence)
         textConfidenceValue = findViewById(R.id.textConfidenceValue)
@@ -126,7 +128,6 @@ class MainActivity : AppCompatActivity() {
         tgtAdapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
         spinnerTargetLang.adapter = tgtAdapter
 
-        // Восстанавливаем настройки
         checkDebug.isChecked = Settings.isDebug(this)
         seekConfidence.progress = Settings.getConfidence(this)
         seekOcrPadding.progress = Settings.getOcrPadding(this)
@@ -146,8 +147,6 @@ class MainActivity : AppCompatActivity() {
         val tgtIndex = targetLanguages.indexOfFirst { it.first == savedTarget }.coerceAtLeast(0)
         spinnerTargetLang.setSelection(tgtIndex)
 
-        // --- Слушатели ---
-
         checkDebug.setOnCheckedChangeListener { _, isChecked ->
             Settings.setDebug(this, isChecked)
         }
@@ -161,7 +160,6 @@ class MainActivity : AppCompatActivity() {
             override fun onStopTrackingTouch(sb: SeekBar?) {}
         })
 
-        // Отступ OCR — debounce 1 сек
         seekOcrPadding.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
             override fun onProgressChanged(sb: SeekBar?, progress: Int, fromUser: Boolean) {
                 updateOcrPaddingLabel(progress)
@@ -178,7 +176,6 @@ class MainActivity : AppCompatActivity() {
             override fun onStopTrackingTouch(sb: SeekBar?) {}
         })
 
-        // Прозрачность — debounce 2 сек
         seekOverlayAlpha.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
             override fun onProgressChanged(sb: SeekBar?, progress: Int, fromUser: Boolean) {
                 updateAlphaLabel(progress)

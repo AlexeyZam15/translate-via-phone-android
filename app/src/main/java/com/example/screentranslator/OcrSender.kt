@@ -26,6 +26,7 @@ class OcrSender(private val pcUrl: String) {
         mode: String = "translate",
         overlayAlpha: Int = 217
     ) {
+        val tTotal = System.nanoTime()
         try {
             val root = JSONObject()
             root.put("frame_width", frameW)
@@ -55,19 +56,32 @@ class OcrSender(private val pcUrl: String) {
             }
             root.put("blocks", blocksArr)
 
-            val body = root.toString().toRequestBody(jsonMediaType)
+            val jsonStr = root.toString()
+            val payloadBytes = jsonStr.toByteArray(Charsets.UTF_8).size
+            DebugTimingLogger.logTiming(
+                "android.ocr_sender_payload_kb", payloadBytes / 1024.0,
+                mapOf("blocks" to result.blocks.size)
+            )
+
+            val body = jsonStr.toRequestBody(jsonMediaType)
             val request = Request.Builder()
                 .url(pcUrl)
                 .post(body)
                 .build()
 
-            client.newCall(request).execute().use { response ->
-                if (!response.isSuccessful) {
-                    Log.w(TAG, "POST /ocr failed: ${response.code}")
+            DebugTimingLogger.timed("android.ocr_sender_http") {
+                client.newCall(request).execute().use { response ->
+                    if (!response.isSuccessful) {
+                        Log.w(TAG, "POST /ocr failed: ${response.code}")
+                    }
                 }
             }
         } catch (e: Exception) {
             Log.e(TAG, "send error", e)
+            DebugTimingLogger.logEvent("android.ocr_sender_error", mapOf("error" to e.message.orEmpty()))
+        } finally {
+            val ms = (System.nanoTime() - tTotal) / 1_000_000.0
+            DebugTimingLogger.logTiming("android.ocr_sender_total", ms)
         }
     }
 

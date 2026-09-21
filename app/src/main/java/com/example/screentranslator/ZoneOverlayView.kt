@@ -20,7 +20,6 @@ class ZoneOverlayView(context: Context) : View(context) {
     private var showTranslation: Boolean = false
     private var bgAlpha: Int = 217
 
-    // Debug
     private val boxPaint = Paint().apply {
         color = Color.RED
         style = Paint.Style.STROKE
@@ -53,7 +52,6 @@ class ZoneOverlayView(context: Context) : View(context) {
         isFakeBoldText = true
     }
 
-    // Перевод
     private val translationBgPaint = Paint().apply {
         style = Paint.Style.FILL
     }
@@ -89,23 +87,34 @@ class ZoneOverlayView(context: Context) : View(context) {
 
         if (sourceWidth <= 0 || sourceHeight <= 0) return
 
-        val scaleX = width.toFloat() / sourceWidth.toFloat()
-        val scaleY = height.toFloat() / sourceHeight.toFloat()
+        val tStart = System.nanoTime()
+        try {
+            val scaleX = width.toFloat() / sourceWidth.toFloat()
+            val scaleY = height.toFloat() / sourceHeight.toFloat()
 
-        for (block in blocks) {
-            val r: Rect = block.boundingBox
-            if (r.width() <= 0 || r.height() <= 0) continue
+            for (block in blocks) {
+                val r: Rect = block.boundingBox
+                if (r.width() <= 0 || r.height() <= 0) continue
 
-            val left = r.left * scaleX
-            val top = r.top * scaleY
-            val right = r.right * scaleX
-            val bottom = r.bottom * scaleY
+                val left = r.left * scaleX
+                val top = r.top * scaleY
+                val right = r.right * scaleX
+                val bottom = r.bottom * scaleY
 
-            if (showTranslation) {
-                drawTranslation(canvas, block, left, top, right, bottom)
-            } else if (showConfidence) {
-                drawDebugZone(canvas, block, left, top, right, bottom, scaleX, scaleY)
+                if (showTranslation) {
+                    drawTranslation(canvas, block, left, top, right, bottom)
+                } else if (showConfidence) {
+                    drawDebugZone(canvas, block, left, top, right, bottom, scaleX, scaleY)
+                }
             }
+        } finally {
+            val ms = (System.nanoTime() - tStart) / 1_000_000.0
+            DebugTimingLogger.logTiming(
+                "android.zone_overlay_ondraw", ms,
+                mapOf("blocks" to blocks.size,
+                    "translation" to showTranslation,
+                    "confidence" to showConfidence)
+            )
         }
     }
 
@@ -169,7 +178,6 @@ class ZoneOverlayView(context: Context) : View(context) {
         left: Float, top: Float, right: Float, bottom: Float,
         scaleX: Float, scaleY: Float
     ) {
-        // --- Зелёная рамка: изначальная зона (с padding'ом) ---
         val ir = block.initialBoundingBox
         if (ir.width() > 0 && ir.height() > 0) {
             val iLeft = ir.left * scaleX
@@ -179,10 +187,8 @@ class ZoneOverlayView(context: Context) : View(context) {
             canvas.drawRect(iLeft, iTop, iRight, iBottom, initialBoxPaint)
         }
 
-        // --- Красная рамка: уточнённая зона ---
         canvas.drawRect(left, top, right, bottom, boxPaint)
 
-        // --- Подпись ---
         val label = block.text.take(30)
         if (label.isNotBlank()) {
             val textWidth = labelPaint.measureText(label)
@@ -195,7 +201,6 @@ class ZoneOverlayView(context: Context) : View(context) {
             canvas.drawText(label, labelLeft + 6f, labelBottom - 6f, labelPaint)
         }
 
-        // --- Confidence ---
         val confText = "${(block.confidence * 100).toInt()}%"
         val confX = right + 8f
         val confY = top + confPaint.textSize

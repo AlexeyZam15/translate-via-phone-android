@@ -22,18 +22,24 @@ class MJPEGReader(
         if (running) return
         running = true
         Thread {
+            DebugTimingLogger.logEvent("android.mjpeg_start", mapOf("url" to url))
             try {
                 val request = Request.Builder().url(url).build()
-                val response = client.newCall(request).execute()
+                val response = DebugTimingLogger.timed("android.mjpeg_connect") {
+                    client.newCall(request).execute()
+                }
                 val stream = response.body?.byteStream()
                     ?: throw IllegalStateException("body == null")
 
-                val input = BufferedInputStream(stream, 64 * 1024)
+                // Буфер 128 KB — меньше syscalls при чтении JPEG-кадров.
+                val input = BufferedInputStream(stream, 128 * 1024)
                 readMjpeg(input)
             } catch (e: Exception) {
                 Log.e(TAG, "MJPEG loop error", e)
+                DebugTimingLogger.logEvent("android.mjpeg_error", mapOf("error" to e.message.orEmpty()))
             } finally {
                 running = false
+                DebugTimingLogger.logEvent("android.mjpeg_stop")
             }
         }.start()
     }
@@ -43,27 +49,35 @@ class MJPEGReader(
     }
 
     private fun readMjpeg(input: BufferedInputStream) {
-        val sojMarker = byteArrayOf(0xFF.toByte(), 0xD8.toByte())  // SOI
-        val eojMarker = byteArrayOf(0xFF.toByte(), 0xD9.toByte())  // EOI
+        val sojMarker = byteArrayOf(0xFF.toByte(), 0xD8.toByte())
+        val eojMarker = byteArrayOf(0xFF.toByte(), 0xD9.toByte())
 
         while (running) {
-            if (!findMarker(input, sojMarker)) break
+            val found = DebugTimingLogger.timed("android.mjpeg_find_soi") {
+                findMarker(input, sojMarker)
+            }
+            if (!found) break
 
             val buffer = ByteArrayOutputStream()
             buffer.write(sojMarker)
 
             var prev = -1
-            while (running) {
-                val b = input.read()
-                if (b == -1) return
-                buffer.write(b)
-                if (prev == 0xFF && b == 0xD9) break
-                prev = b
+            DebugTimingLogger.timed("android.mjpeg_read_body") {
+                while (running) {
+                    val b = input.read()
+                    if (b == -1) return@timed
+                    buffer.write(b)
+                    if (prev == 0xFF && b == 0xD9) break
+                    prev = b
+                }
             }
             if (!running) break
 
             val jpeg = buffer.toByteArray()
             if (jpeg.size > 100) {
+                DebugTimingLogger.logTiming(
+                    "android.mjpeg_frame_size_kb", jpeg.size / 1024.0
+                )
                 onFrame(jpeg)
             }
         }

@@ -1,5 +1,6 @@
 package com.example.screentranslator
 
+import android.content.Context
 import android.util.Log
 import com.google.android.gms.tasks.Task
 import com.google.mlkit.common.model.DownloadConditions
@@ -11,200 +12,426 @@ import com.google.mlkit.nl.translate.Translation
 import com.google.mlkit.nl.translate.TranslateRemoteModel
 import com.google.mlkit.nl.translate.Translator
 import com.google.mlkit.nl.translate.TranslatorOptions
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.withContext
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
+import org.json.JSONArray
+import org.json.JSONObject
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 
 class OcrTranslator(
+    private val context: Context,
     private val targetLang: String,
     private val fixedSourceLang: String? = null
 ) {
 
     private val tag = "OcrTranslator"
+
+    // Настройки серверного перевода. По умолчанию false → ML Kit.
+    @Volatile private var useServer: Boolean = Settings.isUseServerTranslation(context)
+    @Volatile private var serverEndpoint: String = Settings.getTranslateEndpoint(context)
+
+    // Счётчик подряд неудачных HTTP-запросов.
+    // После MAX_HTTP_FAILURES подряд — принудительно ML Kit до конца сессии.
+    private val httpFailures = AtomicInteger(0)
+    private val MAX_HTTP_FAILURES = 3
+
+    // ML Kit
     private val languageIdentifier: LanguageIdentifier = LanguageIdentification.getClient()
-    private val translators = ConcurrentHashMap<String, Translator>()
-    private val ready = AtomicBoolean(false)
     private val modelManager = RemoteModelManager.getInstance()
     private val modelReadyCache = ConcurrentHashMap<String, Boolean>()
 
-    /** Кэш перевода: null = не показывать. */
+    private val mlkitPoolSize = 4  // было 3 — чуть больше параллелизма
+    private val translatorPool = ConcurrentHashMap<String, ArrayDeque<Translator>>()
+
+    private val ready = AtomicBoolean(false)
+
+    // HTTP-клиент с короткими таймаутами — серверный перевод опционален,
+    // не должен блокировать цикл OCR.
+    private val httpClient = OkHttpClient.Builder()
+        .connectTimeout(2, TimeUnit.SECONDS)
+        .writeTimeout(3, TimeUnit.SECONDS)
+        .readTimeout(3, TimeUnit.SECONDS)
+        .build()
+    private val jsonMedia = "application/json; charset=utf-8".toMediaType()
+
     private data class CacheEntry(val value: String?)
     private val cache = ConcurrentHashMap<String, CacheEntry>()
-
-    /** Кэш source-языка по тексту. */
     private val sourceLangCache = ConcurrentHashMap<String, String>()
 
+    /**
+     * Инициализация. Если сервер включён вручную — проверяем его доступность;
+     * иначе сразу греем ML Kit (без ping).
+     */
     suspend fun prepare() {
-        try {
-            val initialSource = fixedSourceLang
-                ?.let { TranslateLanguage.fromLanguageTag(it) }
-                ?: TranslateLanguage.ENGLISH
+        DebugTimingLogger.timed("android.translator_prepare") {
+            try {
+                if (useServer && serverEndpoint.isNotBlank()) {
+                    val ok = pingServer()
+                    if (ok) {
+                        ready.set(true)
+                        Log.d(tag, "Server translation ready: $serverEndpoint")
+                        DebugTimingLogger.logEvent(
+                            "android.translator_ready",
+                            mapOf("mode" to "server", "endpoint" to serverEndpoint)
+                        )
+                        return@timed
+                    } else {
+                        Log.w(tag, "Server unavailable, fallback to ML Kit")
+                        DebugTimingLogger.logEvent(
+                            "android.translator_server_unavailable",
+                            mapOf("endpoint" to serverEndpoint)
+                        )
+                        useServer = false
+                    }
+                }
 
-            if (!isModelReady(initialSource, targetLang)) {
-                downloadModel(initialSource, targetLang)
+                // ML Kit — основной путь
+                val initialSource = fixedSourceLang
+                    ?.let { TranslateLanguage.fromLanguageTag(it) }
+                    ?: TranslateLanguage.ENGLISH
+
+                ensurePool(initialSource, targetLang)
+                if (initialSource != TranslateLanguage.ENGLISH) {
+                    ensurePool(TranslateLanguage.ENGLISH, targetLang)
+                }
+                ready.set(true)
+                Log.d(tag, "ML Kit ready: $initialSource → $targetLang")
+                DebugTimingLogger.logEvent(
+                    "android.translator_ready",
+                    mapOf("mode" to "mlkit", "source" to initialSource, "target" to targetLang)
+                )
+            } catch (t: Throwable) {
+                Log.e(tag, "prepare failed: ${t.message}")
+                ready.set(false)
+                DebugTimingLogger.logEvent(
+                    "android.translator_prepare_error",
+                    mapOf("error" to t.message.orEmpty())
+                )
             }
-
-            val options = TranslatorOptions.Builder()
-                .setSourceLanguage(initialSource)
-                .setTargetLanguage(targetLang)
-                .build()
-            val translator = Translation.getClient(options)
-            translators[initialSource] = translator
-            ready.set(true)
-            Log.d(tag, "Translator prepared: $initialSource → $targetLang")
-        } catch (t: Throwable) {
-            Log.e(tag, "prepare failed: ${t.message}")
-            ready.set(false)
         }
     }
 
     fun isReady(): Boolean = ready.get()
 
-    private suspend fun isModelReady(source: String, target: String): Boolean {
-        val key = "$source->$target"
-        modelReadyCache[key]?.let { return it }
+    // ----------------------------------------------------------
+    // HTTP (опциональный путь)
+    // ----------------------------------------------------------
 
+    private suspend fun pingServer(): Boolean {
         return try {
-            val downloadedModels = modelManager
-                .getDownloadedModels(TranslateRemoteModel::class.java)
-                .await()
-            val downloadedLangs = downloadedModels.map { it.language }.toSet()
-            val sourceEnReady = source == "en" || downloadedLangs.contains(source)
-            val enTargetReady = target == "en" || downloadedLangs.contains(target)
-            val r = sourceEnReady && enTargetReady
-            modelReadyCache[key] = r
-            r
+            withContext(Dispatchers.IO) {
+                val body = "{\"texts\":[],\"source\":\"auto\",\"target\":\"$targetLang\"}"
+                    .toRequestBody(jsonMedia)
+                val req = Request.Builder().url(serverEndpoint).post(body).build()
+                httpClient.newCall(req).execute().use { resp -> resp.isSuccessful }
+            }
         } catch (t: Throwable) {
-            Log.e(tag, "isModelReady check failed: ${t.message}")
+            Log.w(tag, "pingServer failed: ${t.message}")
             false
         }
     }
 
+    private suspend fun translateHttp(texts: List<String>): List<String>? {
+        if (texts.isEmpty()) return emptyList()
+        return try {
+            withContext(Dispatchers.IO) {
+                DebugTimingLogger.timed("android.translator_http_request",
+                    mapOf("count" to texts.size)) {
+                    val arr = JSONArray()
+                    for (t in texts) arr.put(t)
+                    val root = JSONObject()
+                    root.put("texts", arr)
+                    root.put("source", fixedSourceLang ?: "auto")
+                    root.put("target", targetLang)
+                    val body = root.toString().toRequestBody(jsonMedia)
+                    val req = Request.Builder().url(serverEndpoint).post(body).build()
+                    httpClient.newCall(req).execute().use { resp ->
+                        if (!resp.isSuccessful) {
+                            Log.w(tag, "HTTP ${resp.code}")
+                            return@timed null
+                        }
+                        val txt = resp.body?.string() ?: return@timed null
+                        val obj = JSONObject(txt)
+                        val transArr = obj.optJSONArray("translations") ?: return@timed null
+                        val out = ArrayList<String>(transArr.length())
+                        for (i in 0 until transArr.length()) {
+                            out.add(transArr.optString(i, ""))
+                        }
+                        out
+                    }
+                }
+            }
+        } catch (t: Throwable) {
+            Log.w(tag, "translateHttp failed: ${t.message}")
+            null
+        }
+    }
+
+    // ----------------------------------------------------------
+    // ML Kit
+    // ----------------------------------------------------------
+
+    private suspend fun ensurePool(source: String, target: String) {
+        val key = "$source->$target"
+        if (translatorPool.containsKey(key)) return
+
+        if (!isModelReady(source, target)) {
+            downloadModel(source, target)
+        }
+        val deque = ArrayDeque<Translator>(mlkitPoolSize)
+        val options = TranslatorOptions.Builder()
+            .setSourceLanguage(source)
+            .setTargetLanguage(target)
+            .build()
+        repeat(mlkitPoolSize) {
+            deque.addLast(Translation.getClient(options))
+        }
+        translatorPool[key] = deque
+    }
+
+    private suspend fun getMlKitTranslator(source: String, target: String): Translator {
+        val key = "$source->$target"
+        ensurePool(source, target)
+        val deque = translatorPool[key] ?: error("no pool for $key")
+        synchronized(deque) {
+            val t = deque.removeFirst()
+            deque.addLast(t)
+            return t
+        }
+    }
+
+    private suspend fun isModelReady(source: String, target: String): Boolean {
+        val key = "$source->$target"
+        modelReadyCache[key]?.let { return it }
+
+        return DebugTimingLogger.timed("android.translator_is_model_ready") {
+            try {
+                val downloadedModels = modelManager
+                    .getDownloadedModels(TranslateRemoteModel::class.java)
+                    .awaitT()
+                val langs = downloadedModels.map { it.language }.toSet()
+                val ok = (source == "en" || langs.contains(source)) &&
+                        (target == "en" || langs.contains(target))
+                modelReadyCache[key] = ok
+                ok
+            } catch (t: Throwable) {
+                Log.e(tag, "isModelReady failed: ${t.message}")
+                false
+            }
+        }
+    }
+
     private fun downloadModel(source: String, target: String) {
+        val key = "$source->$target"
         if (source != "en") {
-            val sourceModel = TranslateRemoteModel.Builder(source).build()
-            modelManager.download(sourceModel, DownloadConditions.Builder().requireWifi().build())
+            val m = TranslateRemoteModel.Builder(source).build()
+            modelManager.download(m, DownloadConditions.Builder().requireWifi().build())
                 .addOnSuccessListener {
-                    Log.d(tag, "Model downloaded: $source")
-                    modelReadyCache.remove("$source->$target")
+                    modelReadyCache[key] = true
+                    DebugTimingLogger.logEvent("android.translator_model_downloaded",
+                        mapOf("lang" to source))
                 }
                 .addOnFailureListener { e ->
-                    Log.e(tag, "Failed to download $source: ${e.message}")
+                    DebugTimingLogger.logEvent("android.translator_model_download_error",
+                        mapOf("lang" to source, "error" to e.message.orEmpty()))
                 }
         }
         if (target != "en") {
-            val targetModel = TranslateRemoteModel.Builder(target).build()
-            modelManager.download(targetModel, DownloadConditions.Builder().requireWifi().build())
+            val m = TranslateRemoteModel.Builder(target).build()
+            modelManager.download(m, DownloadConditions.Builder().requireWifi().build())
                 .addOnSuccessListener {
-                    Log.d(tag, "Model downloaded: $target")
-                    modelReadyCache.remove("$source->$target")
+                    modelReadyCache[key] = true
+                    DebugTimingLogger.logEvent("android.translator_model_downloaded",
+                        mapOf("lang" to target))
                 }
                 .addOnFailureListener { e ->
-                    Log.e(tag, "Failed to download $target: ${e.message}")
+                    DebugTimingLogger.logEvent("android.translator_model_download_error",
+                        mapOf("lang" to target, "error" to e.message.orEmpty()))
                 }
         }
     }
 
-    /** Определяет source-язык текста (с кэшем). */
     private suspend fun detectSourceLang(text: String): String {
         if (fixedSourceLang != null) {
             return TranslateLanguage.fromLanguageTag(fixedSourceLang) ?: TranslateLanguage.ENGLISH
         }
         sourceLangCache[text]?.let { return it }
 
-        val tagLang = try {
-            languageIdentifier.identifyLanguage(text).await()
-        } catch (t: Throwable) {
-            "und"
+        return DebugTimingLogger.timed("android.translator_detect_lang") {
+            val tagLang = try {
+                languageIdentifier.identifyLanguage(text).awaitT()
+            } catch (t: Throwable) {
+                "und"
+            }
+            val lang = if (tagLang == "und" || tagLang == null) {
+                TranslateLanguage.ENGLISH
+            } else {
+                TranslateLanguage.fromLanguageTag(tagLang) ?: TranslateLanguage.ENGLISH
+            }
+            sourceLangCache[text] = lang
+            lang
         }
-        val lang = if (tagLang == "und" || tagLang == null) {
-            TranslateLanguage.ENGLISH
-        } else {
-            TranslateLanguage.fromLanguageTag(tagLang) ?: TranslateLanguage.ENGLISH
-        }
-        sourceLangCache[text] = lang
-        return lang
     }
 
-    /**
-     * Переводит один блок. Возвращает null, если блок не нужно показывать.
-     * Оптимизация: без проверки языка результата (доверяем ML Kit Translate).
-     */
+    // ----------------------------------------------------------
+    // Public API
+    // ----------------------------------------------------------
+
     suspend fun translate(text: String): String? {
         if (text.isBlank()) return null
         if (!hasLetters(text)) return null
+        if (text.length < 3) return null
         if (!ready.get()) return null
 
         cache[text]?.let { return it.value }
 
-        val sourceLang = detectSourceLang(text)
-
-        if (sourceLang == targetLang) {
-            cache[text] = CacheEntry(null)
-            return null
-        }
-
-        if (!isModelReady(sourceLang, targetLang)) {
-            downloadModel(sourceLang, targetLang)
-            return null
-        }
-
-        val translator = translators.getOrPut(sourceLang) {
-            val options = TranslatorOptions.Builder()
-                .setSourceLanguage(sourceLang)
-                .setTargetLanguage(targetLang)
-                .build()
-            Translation.getClient(options)
-        }
-
-        val result = try {
-            translator.translate(text).await()
-        } catch (t: Throwable) {
-            Log.e(tag, "translate failed: ${t.message}")
-            null
-        }
-
-        if (result == null) return null
-
-        // Перевод не изменил текст — не показывать
-        if (result.trim().equals(text.trim(), ignoreCase = true)) {
-            cache[text] = CacheEntry(null)
-            return null
-        }
-
-        cache[text] = CacheEntry(result)
-        return result
+        val result = translateAll(listOf(text))
+        val found = result.firstOrNull { it.first == text }?.second
+        cache[text] = CacheEntry(found)
+        return found
     }
 
     /**
-     * Параллельный перевод списка текстов. Возвращает список пар
-     * (оригинал, перевод) — только для тех блоков, где перевод удался.
+     * Пакетный перевод.
+     * Основной путь — ML Kit (локально, быстро).
+     * Если пользователь включил серверный перевод и он стабилен — HTTP.
+     * При 3 неудачах HTTP подряд — принудительный ML Kit.
      */
-    suspend fun translateAll(texts: List<String>): List<Pair<String, String>> = coroutineScope {
-        val jobs = texts.map { t -> async { t to translate(t) } }
-        jobs.mapNotNull { job ->
-            val (orig, translated) = job.await()
-            if (translated == null) null else orig to translated
+    suspend fun translateAll(texts: List<String>): List<Pair<String, String>> {
+        val tTotal = System.nanoTime()
+        try {
+            if (!ready.get()) return emptyList()
+
+            val valid = texts.filter { it.isNotBlank() && hasLetters(it) && it.length >= 3 }
+            if (valid.isEmpty()) return emptyList()
+
+            val result = ArrayList<Pair<String, String>>(valid.size)
+            val toTranslate = ArrayList<String>(valid.size)
+            for (t in valid) {
+                val cached = cache[t]
+                if (cached != null) {
+                    if (cached.value != null) result.add(t to cached.value!!)
+                } else if (!toTranslate.contains(t)) {
+                    toTranslate.add(t)
+                }
+            }
+            if (toTranslate.isEmpty()) return result
+
+            // ---- Опциональный HTTP-путь ----
+            val httpAllowed = useServer
+                    && serverEndpoint.isNotBlank()
+                    && httpFailures.get() < MAX_HTTP_FAILURES
+
+            if (httpAllowed) {
+                val httpResult = DebugTimingLogger.timed(
+                    "android.translator_translate_all_http",
+                    mapOf("count" to toTranslate.size)
+                ) {
+                    translateHttp(toTranslate)
+                }
+
+                if (httpResult != null && httpResult.size == toTranslate.size) {
+                    httpFailures.set(0)  // сбрасываем счётчик при успехе
+                    for (i in toTranslate.indices) {
+                        val orig = toTranslate[i]
+                        val tr = httpResult[i]
+                        if (tr.isBlank() || tr.trim().equals(orig.trim(), ignoreCase = true)) {
+                            cache[orig] = CacheEntry(null)
+                        } else {
+                            cache[orig] = CacheEntry(tr)
+                            result.add(orig to tr)
+                        }
+                    }
+                    return result
+                } else {
+                    // HTTP не сработал — увеличиваем счётчик
+                    val fails = httpFailures.incrementAndGet()
+                    Log.w(tag, "HTTP translate failed ($fails/$MAX_HTTP_FAILURES), fallback to ML Kit")
+                    DebugTimingLogger.logEvent("android.translator_http_fallback",
+                        mapOf("fails" to fails))
+                    if (fails >= MAX_HTTP_FAILURES) {
+                        Log.w(tag, "Too many HTTP failures — switching to ML Kit permanently")
+                        DebugTimingLogger.logEvent("android.translator_force_mlkit")
+                        useServer = false
+                    }
+                }
+            }
+
+            // ---- ML Kit (основной путь) ----
+            return DebugTimingLogger.timed(
+                "android.translator_translate_all_mlkit",
+                mapOf("count" to toTranslate.size)
+            ) {
+                val sourceLang = DebugTimingLogger.timed("android.translator_detect_lang_batch") {
+                    detectSourceLang(toTranslate.first())
+                }
+
+                if (sourceLang == targetLang) {
+                    for (t in toTranslate) cache[t] = CacheEntry(null)
+                    return@timed result
+                }
+
+                val translator = getMlKitTranslator(sourceLang, targetLang)
+
+                val translated = coroutineScope {
+                    toTranslate.map { t ->
+                        async {
+                            val r = try {
+                                translator.translate(t).awaitT()
+                            } catch (ex: Throwable) {
+                                Log.e(tag, "mlkit translate failed: ${ex.message}")
+                                null
+                            }
+                            t to r
+                        }
+                    }.awaitAll()
+                }
+
+                for ((orig, tr) in translated) {
+                    if (tr == null || tr.trim().equals(orig.trim(), ignoreCase = true)) {
+                        cache[orig] = CacheEntry(null)
+                    } else {
+                        cache[orig] = CacheEntry(tr)
+                        result.add(orig to tr)
+                    }
+                }
+                result
+            }
+        } finally {
+            val ms = (System.nanoTime() - tTotal) / 1_000_000.0
+            DebugTimingLogger.logTiming("android.translator_translate_all_total", ms)
         }
     }
 
     private fun hasLetters(s: String): Boolean {
-        for (c in s) {
-            if (c.isLetter()) return true
-        }
+        for (c in s) if (c.isLetter()) return true
         return false
     }
 
     fun close() {
         try { languageIdentifier.close() } catch (_: Throwable) {}
-        for (t in translators.values) {
-            try { t.close() } catch (_: Throwable) {}
+        for (deque in translatorPool.values) {
+            synchronized(deque) {
+                for (t in deque) {
+                    try { t.close() } catch (_: Throwable) {}
+                }
+                deque.clear()
+            }
         }
-        translators.clear()
+        translatorPool.clear()
         cache.clear()
         sourceLangCache.clear()
         modelReadyCache.clear()
@@ -212,7 +439,7 @@ class OcrTranslator(
     }
 }
 
-private suspend fun <T> Task<T>.await(): T = suspendCancellableCoroutine { cont ->
+private suspend fun <T> Task<T>.awaitT(): T = suspendCancellableCoroutine { cont ->
     addOnSuccessListener { cont.resume(it) }
     addOnFailureListener { cont.resumeWithException(it) }
 }
