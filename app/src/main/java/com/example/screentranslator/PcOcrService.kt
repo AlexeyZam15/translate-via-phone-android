@@ -16,7 +16,6 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import java.util.concurrent.atomic.AtomicBoolean
 
@@ -36,6 +35,10 @@ class PcOcrService : Service(), SharedPreferences.OnSharedPreferenceChangeListen
     private var targetLang: String = "ru"
     private var debugMode: Boolean = false
     private var overlayAlpha: Int = 217
+
+    // Кэш предыдущего результата — чтобы не отправлять неизменённое
+    @Volatile private var lastBlocksHash: Int = 0
+    @Volatile private var lastMode: String = ""
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val engineName = intent?.getStringExtra(EXTRA_ENGINE) ?: OcrType.ML_KIT.name
@@ -96,6 +99,7 @@ class PcOcrService : Service(), SharedPreferences.OnSharedPreferenceChangeListen
         scope.launch {
             var blockCount = 0
             var mode = "translate"
+            var sent = false
             try {
                 val bitmap: Bitmap? = DebugTimingLogger.timed("android.pc_ocr_decode") {
                     BitmapFactory.decodeByteArray(jpegBytes, 0, jpegBytes.size)
@@ -139,9 +143,18 @@ class PcOcrService : Service(), SharedPreferences.OnSharedPreferenceChangeListen
 
                 if (debugMode || translator?.isReady() != true) {
                     blockCount = filtered.size
+                    val hash = computeBlocksHash(filtered, mode)
+                    if (hash == lastBlocksHash && mode == lastMode) {
+                        // Ничего не изменилось — не отправляем
+                        return@launch
+                    }
+                    lastBlocksHash = hash
+                    lastMode = mode
+
                     DebugTimingLogger.timed("android.pc_ocr_send") {
                         sender?.send(OcrResult(result.text, filtered), fw, fh, mode, overlayAlpha)
                     }
+                    sent = true
                     return@launch
                 }
 
@@ -157,9 +170,18 @@ class PcOcrService : Service(), SharedPreferences.OnSharedPreferenceChangeListen
                 blockCount = outBlocks.size
 
                 if (outBlocks.isNotEmpty()) {
+                    val hash = computeBlocksHash(outBlocks, mode)
+                    if (hash == lastBlocksHash && mode == lastMode) {
+                        // Ничего не изменилось — не отправляем
+                        return@launch
+                    }
+                    lastBlocksHash = hash
+                    lastMode = mode
+
                     DebugTimingLogger.timed("android.pc_ocr_send") {
                         sender?.send(OcrResult(result.text, outBlocks), fw, fh, mode, overlayAlpha)
                     }
+                    sent = true
                 }
             } catch (e: Exception) {
                 Log.e(TAG, "onFrame error", e)
@@ -169,13 +191,35 @@ class PcOcrService : Service(), SharedPreferences.OnSharedPreferenceChangeListen
                 val ms = (System.nanoTime() - tCycleStart) / 1_000_000.0
                 DebugTimingLogger.logTiming(
                     "android.pc_ocr_cycle_total", ms,
-                    mapOf("blocks" to blockCount, "mode" to mode,
-                        "jpeg_kb" to jpegBytes.size / 1024)
+                    mapOf(
+                        "blocks" to blockCount,
+                        "mode" to mode,
+                        "jpeg_kb" to jpegBytes.size / 1024,
+                        "sent" to sent
+                    )
                 )
-                delay(100)
+                // УБРАН delay(100) — следующий кадр обрабатывается сразу,
+                // как только MJPEGReader получит новый.
                 isProcessing.set(false)
             }
         }
+    }
+
+    /**
+     * Хэш блоков: текст + координаты + уверенность.
+     * Если блоки не изменились — хэш совпадёт, и отправка пропускается.
+     */
+    private fun computeBlocksHash(blocks: List<OcrBlock>, mode: String): Int {
+        var h = mode.hashCode()
+        for (b in blocks) {
+            h = h * 31 + b.text.hashCode()
+            val r = b.boundingBox
+            h = h * 31 + r.left
+            h = h * 31 + r.top
+            h = h * 31 + r.right
+            h = h * 31 + r.bottom
+        }
+        return h
     }
 
     private fun buildNotification(): Notification {

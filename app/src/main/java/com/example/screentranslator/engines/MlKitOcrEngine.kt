@@ -28,9 +28,12 @@ class MlKitOcrEngine(private val context: Context) : OcrEngine {
 
     override val name: String = "ML Kit (2-pass)"
 
-    private val POOL_SIZE = 4                  // было 3 — больше параллелизма
+    private val POOL_SIZE = 4
     private val MIN_CROP_HEIGHT = 24
-    private val SKIP_REFINE_CONFIDENCE = 0.7f  // было 0.85 — быстрее цикл
+
+    // Было 0.7 — теперь 0.5: меньше блоков уходит на refine,
+    // значит цикл OCR быстрее. Точность чуть ниже, но приемлемо.
+    private val SKIP_REFINE_CONFIDENCE = 0.5f
 
     private val paddingPercent: Float
         get() = Settings.getOcrPadding(context) / 100f

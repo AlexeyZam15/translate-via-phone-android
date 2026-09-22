@@ -3,8 +3,8 @@ package com.example.screentranslator
 import android.util.Log
 import okhttp3.OkHttpClient
 import okhttp3.Request
-import java.io.BufferedInputStream
 import java.io.ByteArrayOutputStream
+import java.io.InputStream
 import java.util.concurrent.TimeUnit
 
 class MJPEGReader(
@@ -17,6 +17,14 @@ class MJPEGReader(
         .build()
 
     @Volatile private var running = false
+
+    // --- Общий буфер для чтения ---
+    // Читаем из потока блоками (64 КБ), но потребляем побайтово.
+    // Так мы НЕ теряем байты после SOI, и получаем скорость
+    // буферизованного чтения.
+    private val readBuf = ByteArray(BUF_SIZE)
+    private var bufPos = 0
+    private var bufLen = 0
 
     fun start() {
         if (running) return
@@ -31,12 +39,15 @@ class MJPEGReader(
                 val stream = response.body?.byteStream()
                     ?: throw IllegalStateException("body == null")
 
-                // Буфер 128 KB — меньше syscalls при чтении JPEG-кадров.
-                val input = BufferedInputStream(stream, 128 * 1024)
-                readMjpeg(input)
+                // Сбрасываем буфер на всякий случай
+                bufPos = 0
+                bufLen = 0
+
+                readMjpeg(stream)
             } catch (e: Exception) {
                 Log.e(TAG, "MJPEG loop error", e)
-                DebugTimingLogger.logEvent("android.mjpeg_error", mapOf("error" to e.message.orEmpty()))
+                DebugTimingLogger.logEvent("android.mjpeg_error",
+                    mapOf("error" to e.message.orEmpty()))
             } finally {
                 running = false
                 DebugTimingLogger.logEvent("android.mjpeg_stop")
@@ -48,30 +59,80 @@ class MJPEGReader(
         running = false
     }
 
-    private fun readMjpeg(input: BufferedInputStream) {
-        val sojMarker = byteArrayOf(0xFF.toByte(), 0xD8.toByte())
-        val eojMarker = byteArrayOf(0xFF.toByte(), 0xD9.toByte())
+    /**
+     * Читает один байт. Если буфер исчерпан — добирает из потока.
+     * Возвращает -1 при EOF или ошибке.
+     */
+    private fun readByte(input: InputStream): Int {
+        if (bufPos >= bufLen) {
+            val n = try {
+                input.read(readBuf, 0, readBuf.size)
+            } catch (e: Exception) {
+                -1
+            }
+            if (n <= 0) return -1
+            bufPos = 0
+            bufLen = n
+        }
+        return readBuf[bufPos++].toInt() and 0xFF
+    }
+
+    /**
+     * Ищет маркер (двухбайтовую последовательность) в потоке.
+     * Читает байт за байтом из буфера. Байты после маркера
+     * остаются в буфере и будут прочитаны следующими вызовами.
+     */
+    private fun findMarker(input: InputStream, m1: Int, m2: Int): Boolean {
+        var prev = -1
+        while (running) {
+            val b = readByte(input)
+            if (b < 0) return false
+            if (prev == m1 && b == m2) return true
+            prev = b
+        }
+        return false
+    }
+
+    /**
+     * Читает тело JPEG до маркера EOI (0xFF 0xD9).
+     * Всё прочитанное пишет в out. Байты после EOI
+     * остаются в буфере.
+     */
+    private fun readJpegBody(input: InputStream, out: ByteArrayOutputStream): Boolean {
+        var prev = -1
+        while (running) {
+            val b = readByte(input)
+            if (b < 0) return false
+            out.write(b)
+            if (prev == 0xFF && b == 0xD9) return true
+            prev = b
+        }
+        return false
+    }
+
+    private fun readMjpeg(input: InputStream) {
+        val buffer = ByteArrayOutputStream(256 * 1024)
 
         while (running) {
-            val found = DebugTimingLogger.timed("android.mjpeg_find_soi") {
-                findMarker(input, sojMarker)
-            }
-            if (!found) break
+            // 1. Ищем SOI (0xFF 0xD8)
+            val soiFound = findMarker(input, 0xFF, 0xD8)
+            if (!soiFound) break
 
-            val buffer = ByteArrayOutputStream()
-            buffer.write(sojMarker)
+            // 2. Начинаем собирать JPEG (с SOI)
+            buffer.reset()
+            buffer.write(0xFF)
+            buffer.write(0xD8)
 
-            var prev = -1
-            DebugTimingLogger.timed("android.mjpeg_read_body") {
-                while (running) {
-                    val b = input.read()
-                    if (b == -1) return@timed
-                    buffer.write(b)
-                    if (prev == 0xFF && b == 0xD9) break
-                    prev = b
-                }
+            // 3. Читаем тело до EOI (0xFF 0xD9)
+            val eoiFound = DebugTimingLogger.timed("android.mjpeg_read_body") {
+                readJpegBody(input, buffer)
             }
-            if (!running) break
+
+            if (!eoiFound) {
+                if (!running) break
+                // Не нашли EOI — начинаем заново
+                continue
+            }
 
             val jpeg = buffer.toByteArray()
             if (jpeg.size > 100) {
@@ -83,22 +144,8 @@ class MJPEGReader(
         }
     }
 
-    private fun findMarker(input: BufferedInputStream, marker: ByteArray): Boolean {
-        var match = 0
-        while (running) {
-            val b = input.read()
-            if (b == -1) return false
-            if (b.toByte() == marker[match]) {
-                match++
-                if (match == marker.size) return true
-            } else {
-                match = if (b.toByte() == marker[0]) 1 else 0
-            }
-        }
-        return false
-    }
-
     companion object {
         private const val TAG = "MJPEGReader"
+        private const val BUF_SIZE = 64 * 1024
     }
 }

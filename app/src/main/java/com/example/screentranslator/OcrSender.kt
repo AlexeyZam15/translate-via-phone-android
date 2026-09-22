@@ -1,23 +1,31 @@
 package com.example.screentranslator
 
 import android.util.Log
+import okhttp3.Call
+import okhttp3.Callback
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
+import okhttp3.Response
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.IOException
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 
 class OcrSender(private val pcUrl: String) {
 
     private val client = OkHttpClient.Builder()
-        .connectTimeout(3, TimeUnit.SECONDS)
-        .writeTimeout(3, TimeUnit.SECONDS)
-        .readTimeout(3, TimeUnit.SECONDS)
+        .connectTimeout(1500, TimeUnit.MILLISECONDS)
+        .writeTimeout(1500, TimeUnit.MILLISECONDS)
+        .readTimeout(1500, TimeUnit.MILLISECONDS)
         .build()
 
     private val jsonMediaType = "application/json; charset=utf-8".toMediaType()
+
+    private val okCount = AtomicInteger(0)
+    private val errCount = AtomicInteger(0)
 
     fun send(
         result: OcrResult,
@@ -26,7 +34,11 @@ class OcrSender(private val pcUrl: String) {
         mode: String = "translate",
         overlayAlpha: Int = 217
     ) {
-        val tTotal = System.nanoTime()
+        if (result.blocks.isEmpty()) return
+
+        val tBuild = System.nanoTime()
+        val jsonStr: String
+        val payloadBytes: Int
         try {
             val root = JSONObject()
             root.put("frame_width", frameW)
@@ -56,33 +68,59 @@ class OcrSender(private val pcUrl: String) {
             }
             root.put("blocks", blocksArr)
 
-            val jsonStr = root.toString()
-            val payloadBytes = jsonStr.toByteArray(Charsets.UTF_8).size
+            jsonStr = root.toString()
+            payloadBytes = jsonStr.toByteArray(Charsets.UTF_8).size
             DebugTimingLogger.logTiming(
-                "android.ocr_sender_payload_kb", payloadBytes / 1024.0,
+                "android.ocr_sender_build_json",
+                (System.nanoTime() - tBuild) / 1_000_000.0,
                 mapOf("blocks" to result.blocks.size)
             )
+        } catch (e: Exception) {
+            Log.e(TAG, "build json error", e)
+            DebugTimingLogger.logEvent("android.ocr_sender_build_error",
+                mapOf("error" to e.message.orEmpty()))
+            return
+        }
 
-            val body = jsonStr.toRequestBody(jsonMediaType)
-            val request = Request.Builder()
-                .url(pcUrl)
-                .post(body)
-                .build()
+        val body = jsonStr.toRequestBody(jsonMediaType)
+        val request = Request.Builder()
+            .url(pcUrl)
+            .post(body)
+            .build()
 
-            DebugTimingLogger.timed("android.ocr_sender_http") {
-                client.newCall(request).execute().use { response ->
-                    if (!response.isSuccessful) {
-                        Log.w(TAG, "POST /ocr failed: ${response.code}")
+        // Асинхронный запрос — НЕ блокирует вызывающий поток.
+        // Это позволяет циклу OCR/перевода работать без пауз на отправку.
+        val tStart = System.nanoTime()
+        client.newCall(request).enqueue(object : Callback {
+            override fun onFailure(call: Call, e: IOException) {
+                errCount.incrementAndGet()
+                Log.w(TAG, "send failed: ${e.message}")
+                DebugTimingLogger.logEvent("android.ocr_sender_error",
+                    mapOf("error" to e.message.orEmpty()))
+            }
+
+            override fun onResponse(call: Call, response: Response) {
+                response.use {
+                    val ok = it.isSuccessful
+                    if (ok) {
+                        okCount.incrementAndGet()
+                    } else {
+                        errCount.incrementAndGet()
+                        Log.w(TAG, "POST /ocr failed: ${it.code}")
                     }
+                    val ms = (System.nanoTime() - tStart) / 1_000_000.0
+                    DebugTimingLogger.logTiming(
+                        "android.ocr_sender_http", ms,
+                        mapOf(
+                            "ok" to ok,
+                            "payload_kb" to payloadBytes / 1024.0,
+                            "ok_count" to okCount.get(),
+                            "err_count" to errCount.get()
+                        )
+                    )
                 }
             }
-        } catch (e: Exception) {
-            Log.e(TAG, "send error", e)
-            DebugTimingLogger.logEvent("android.ocr_sender_error", mapOf("error" to e.message.orEmpty()))
-        } finally {
-            val ms = (System.nanoTime() - tTotal) / 1_000_000.0
-            DebugTimingLogger.logTiming("android.ocr_sender_total", ms)
-        }
+        })
     }
 
     companion object {

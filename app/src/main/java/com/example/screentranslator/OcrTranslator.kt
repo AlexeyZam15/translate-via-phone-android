@@ -39,12 +39,9 @@ class OcrTranslator(
 
     private val tag = "OcrTranslator"
 
-    // Настройки серверного перевода. По умолчанию false → ML Kit.
     @Volatile private var useServer: Boolean = Settings.isUseServerTranslation(context)
     @Volatile private var serverEndpoint: String = Settings.getTranslateEndpoint(context)
 
-    // Счётчик подряд неудачных HTTP-запросов.
-    // После MAX_HTTP_FAILURES подряд — принудительно ML Kit до конца сессии.
     private val httpFailures = AtomicInteger(0)
     private val MAX_HTTP_FAILURES = 3
 
@@ -53,17 +50,18 @@ class OcrTranslator(
     private val modelManager = RemoteModelManager.getInstance()
     private val modelReadyCache = ConcurrentHashMap<String, Boolean>()
 
-    private val mlkitPoolSize = 4  // было 3 — чуть больше параллелизма
+    // Пул переводчиков. Ключ — "src->tgt". Значение — очередь свободных инстансов.
+    private val mlkitPoolSize = 4
     private val translatorPool = ConcurrentHashMap<String, ArrayDeque<Translator>>()
+    private val poolLock = Any()
 
     private val ready = AtomicBoolean(false)
 
-    // HTTP-клиент с короткими таймаутами — серверный перевод опционален,
-    // не должен блокировать цикл OCR.
+    // HTTP-клиент с короткими таймаутами
     private val httpClient = OkHttpClient.Builder()
-        .connectTimeout(2, TimeUnit.SECONDS)
-        .writeTimeout(3, TimeUnit.SECONDS)
-        .readTimeout(3, TimeUnit.SECONDS)
+        .connectTimeout(1500, TimeUnit.MILLISECONDS)
+        .writeTimeout(2000, TimeUnit.MILLISECONDS)
+        .readTimeout(2000, TimeUnit.MILLISECONDS)
         .build()
     private val jsonMedia = "application/json; charset=utf-8".toMediaType()
 
@@ -71,10 +69,6 @@ class OcrTranslator(
     private val cache = ConcurrentHashMap<String, CacheEntry>()
     private val sourceLangCache = ConcurrentHashMap<String, String>()
 
-    /**
-     * Инициализация. Если сервер включён вручную — проверяем его доступность;
-     * иначе сразу греем ML Kit (без ping).
-     */
     suspend fun prepare() {
         DebugTimingLogger.timed("android.translator_prepare") {
             try {
@@ -98,7 +92,6 @@ class OcrTranslator(
                     }
                 }
 
-                // ML Kit — основной путь
                 val initialSource = fixedSourceLang
                     ?.let { TranslateLanguage.fromLanguageTag(it) }
                     ?: TranslateLanguage.ENGLISH
@@ -181,35 +174,65 @@ class OcrTranslator(
     }
 
     // ----------------------------------------------------------
-    // ML Kit
+    // ML Kit (пул)
     // ----------------------------------------------------------
 
     private suspend fun ensurePool(source: String, target: String) {
         val key = "$source->$target"
-        if (translatorPool.containsKey(key)) return
+        synchronized(poolLock) {
+            if (translatorPool.containsKey(key)) return
+        }
 
         if (!isModelReady(source, target)) {
             downloadModel(source, target)
         }
-        val deque = ArrayDeque<Translator>(mlkitPoolSize)
         val options = TranslatorOptions.Builder()
             .setSourceLanguage(source)
             .setTargetLanguage(target)
             .build()
+        val deque = ArrayDeque<Translator>(mlkitPoolSize)
         repeat(mlkitPoolSize) {
             deque.addLast(Translation.getClient(options))
         }
-        translatorPool[key] = deque
+        synchronized(poolLock) {
+            translatorPool[key] = deque
+        }
     }
 
-    private suspend fun getMlKitTranslator(source: String, target: String): Translator {
+    /**
+     * Забирает переводчик из пула. Если свободных нет — создаёт временный
+     * (не кладёт в пул, чтобы не превысить размер).
+     */
+    private suspend fun borrowTranslator(source: String, target: String): Translator {
         val key = "$source->$target"
         ensurePool(source, target)
-        val deque = translatorPool[key] ?: error("no pool for $key")
-        synchronized(deque) {
-            val t = deque.removeFirst()
-            deque.addLast(t)
-            return t
+        synchronized(poolLock) {
+            val deque = translatorPool[key]
+            if (deque != null && deque.isNotEmpty()) {
+                return deque.removeFirst()
+            }
+        }
+        // Все заняты — создаём одноразовый
+        val options = TranslatorOptions.Builder()
+            .setSourceLanguage(source)
+            .setTargetLanguage(target)
+            .build()
+        return Translation.getClient(options)
+    }
+
+    private fun returnTranslator(source: String, target: String, t: Translator, temporary: Boolean) {
+        if (temporary) {
+            try { t.close() } catch (_: Throwable) {}
+            return
+        }
+        val key = "$source->$target"
+        synchronized(poolLock) {
+            val deque = translatorPool[key]
+            if (deque != null && deque.size < mlkitPoolSize) {
+                deque.addLast(t)
+            } else {
+                try { t.close() } catch (_: Throwable) {}
+            }
         }
     }
 
@@ -281,7 +304,9 @@ class OcrTranslator(
             } else {
                 TranslateLanguage.fromLanguageTag(tagLang) ?: TranslateLanguage.ENGLISH
             }
-            sourceLangCache[text] = lang
+            if (sourceLangCache.size < 200) {
+                sourceLangCache[text] = lang
+            }
             lang
         }
     }
@@ -300,16 +325,10 @@ class OcrTranslator(
 
         val result = translateAll(listOf(text))
         val found = result.firstOrNull { it.first == text }?.second
-        cache[text] = CacheEntry(found)
+        if (cache.size < 2000) cache[text] = CacheEntry(found)
         return found
     }
 
-    /**
-     * Пакетный перевод.
-     * Основной путь — ML Kit (локально, быстро).
-     * Если пользователь включил серверный перевод и он стабилен — HTTP.
-     * При 3 неудачах HTTP подряд — принудительный ML Kit.
-     */
     suspend fun translateAll(texts: List<String>): List<Pair<String, String>> {
         val tTotal = System.nanoTime()
         try {
@@ -344,7 +363,7 @@ class OcrTranslator(
                 }
 
                 if (httpResult != null && httpResult.size == toTranslate.size) {
-                    httpFailures.set(0)  // сбрасываем счётчик при успехе
+                    httpFailures.set(0)
                     for (i in toTranslate.indices) {
                         val orig = toTranslate[i]
                         val tr = httpResult[i]
@@ -357,7 +376,6 @@ class OcrTranslator(
                     }
                     return result
                 } else {
-                    // HTTP не сработал — увеличиваем счётчик
                     val fails = httpFailures.incrementAndGet()
                     Log.w(tag, "HTTP translate failed ($fails/$MAX_HTTP_FAILURES), fallback to ML Kit")
                     DebugTimingLogger.logEvent("android.translator_http_fallback",
@@ -370,7 +388,7 @@ class OcrTranslator(
                 }
             }
 
-            // ---- ML Kit (основной путь) ----
+            // ---- ML Kit (параллельно) ----
             return DebugTimingLogger.timed(
                 "android.translator_translate_all_mlkit",
                 mapOf("count" to toTranslate.size)
@@ -384,18 +402,29 @@ class OcrTranslator(
                     return@timed result
                 }
 
-                val translator = getMlKitTranslator(sourceLang, targetLang)
-
+                // Параллельная обработка: на каждый текст берём свой переводчик из пула.
                 val translated = coroutineScope {
                     toTranslate.map { t ->
-                        async {
-                            val r = try {
-                                translator.translate(t).awaitT()
-                            } catch (ex: Throwable) {
-                                Log.e(tag, "mlkit translate failed: ${ex.message}")
-                                null
+                        async(Dispatchers.Default) {
+                            var temp = false
+                            val translator = borrowTranslator(sourceLang, targetLang)
+                            // Если вернули не из пула — временный (пул пуст)
+                            temp = synchronized(poolLock) {
+                                val key = "$sourceLang->$targetLang"
+                                val deque = translatorPool[key]
+                                deque == null || deque.none { it === translator }
                             }
-                            t to r
+                            try {
+                                val r = try {
+                                    translator.translate(t).awaitT()
+                                } catch (ex: Throwable) {
+                                    Log.e(tag, "mlkit translate failed: ${ex.message}")
+                                    null
+                                }
+                                t to r
+                            } finally {
+                                returnTranslator(sourceLang, targetLang, translator, temp)
+                            }
                         }
                     }.awaitAll()
                 }
@@ -423,15 +452,15 @@ class OcrTranslator(
 
     fun close() {
         try { languageIdentifier.close() } catch (_: Throwable) {}
-        for (deque in translatorPool.values) {
-            synchronized(deque) {
+        synchronized(poolLock) {
+            for (deque in translatorPool.values) {
                 for (t in deque) {
                     try { t.close() } catch (_: Throwable) {}
                 }
                 deque.clear()
             }
+            translatorPool.clear()
         }
-        translatorPool.clear()
         cache.clear()
         sourceLangCache.clear()
         modelReadyCache.clear()
