@@ -31,9 +31,9 @@ class MlKitOcrEngine(private val context: Context) : OcrEngine {
     private val POOL_SIZE = 4
     private val MIN_CROP_HEIGHT = 24
 
-    // Было 0.7 — теперь 0.5: меньше блоков уходит на refine,
-    // значит цикл OCR быстрее. Точность чуть ниже, но приемлемо.
-    private val SKIP_REFINE_CONFIDENCE = 0.5f
+    // Увеличено с 0.5 до 0.7: пропускаем refine у большинства блоков,
+    // ocr_pass2 короче, OCR быстрее на сложных сценах.
+    private val SKIP_REFINE_CONFIDENCE = 0.7f
 
     private val paddingPercent: Float
         get() = Settings.getOcrPadding(context) / 100f

@@ -181,12 +181,14 @@ class MainActivity : AppCompatActivity() {
                 updateAlphaLabel(progress)
                 if (!fromUser) return
 
+                // Задержка уменьшена с 2000 до 300 мс — эффект применяется
+                // почти мгновенно, но всё ещё не спамит prefs на каждый пиксель.
                 pendingAlphaSave?.let { uiHandler.removeCallbacks(it) }
                 val r = Runnable {
                     Settings.setOverlayAlpha(this@MainActivity, progress)
                 }
                 pendingAlphaSave = r
-                uiHandler.postDelayed(r, 2000)
+                uiHandler.postDelayed(r, 300)
             }
             override fun onStartTrackingTouch(sb: SeekBar?) {}
             override fun onStopTrackingTouch(sb: SeekBar?) {}

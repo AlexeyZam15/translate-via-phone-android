@@ -18,6 +18,7 @@ import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -50,14 +51,20 @@ class OcrTranslator(
     private val modelManager = RemoteModelManager.getInstance()
     private val modelReadyCache = ConcurrentHashMap<String, Boolean>()
 
-    // Пул переводчиков. Ключ — "src->tgt". Значение — очередь свободных инстансов.
-    private val mlkitPoolSize = 4
+    // ИЗМЕНЕНО: кэш определённого языка на всю сессию.
+    // Раньше detectSourceLang вызывался на каждый translateAll —
+    // это давало ~50 ms на каждый батч (см. лог: android.translator_detect_lang_batch).
+    // Теперь язык определяется один раз, если fixedSourceLang == null.
+    @Volatile private var detectedSourceLangCache: String? = null
+
+    // Пул translator'ов. 6 — покрывает большинство OCR-сцен
+    private val mlkitPoolSize = 6
     private val translatorPool = ConcurrentHashMap<String, ArrayDeque<Translator>>()
     private val poolLock = Any()
 
     private val ready = AtomicBoolean(false)
 
-    // HTTP-клиент с короткими таймаутами
+    // HTTP-клиент
     private val httpClient = OkHttpClient.Builder()
         .connectTimeout(1500, TimeUnit.MILLISECONDS)
         .writeTimeout(2000, TimeUnit.MILLISECONDS)
@@ -68,6 +75,10 @@ class OcrTranslator(
     private data class CacheEntry(val value: String?)
     private val cache = ConcurrentHashMap<String, CacheEntry>()
     private val sourceLangCache = ConcurrentHashMap<String, String>()
+
+    // ----------------------------------------------------------
+    // Подготовка: скачивание моделей + прогрев пула
+    // ----------------------------------------------------------
 
     suspend fun prepare() {
         DebugTimingLogger.timed("android.translator_prepare") {
@@ -96,10 +107,36 @@ class OcrTranslator(
                     ?.let { TranslateLanguage.fromLanguageTag(it) }
                     ?: TranslateLanguage.ENGLISH
 
+                val langsToDownload = LinkedHashSet<String>()
+                langsToDownload.add(targetLang)
+                langsToDownload.add(initialSource)
+                if (initialSource != TranslateLanguage.ENGLISH && targetLang != TranslateLanguage.ENGLISH) {
+                    langsToDownload.add(TranslateLanguage.ENGLISH)
+                }
+
+                DebugTimingLogger.timed("android.translator_download_models") {
+                    coroutineScope {
+                        langsToDownload.map { lang ->
+                            async(Dispatchers.IO) {
+                                try {
+                                    ensureModelDownloaded(lang)
+                                } catch (t: Throwable) {
+                                    Log.e(tag, "download $lang failed: ${t.message}")
+                                    DebugTimingLogger.logEvent(
+                                        "android.translator_model_download_error",
+                                        mapOf("lang" to lang, "error" to t.message.orEmpty())
+                                    )
+                                }
+                            }
+                        }.awaitAll()
+                    }
+                }
+
                 ensurePool(initialSource, targetLang)
                 if (initialSource != TranslateLanguage.ENGLISH) {
                     ensurePool(TranslateLanguage.ENGLISH, targetLang)
                 }
+
                 ready.set(true)
                 Log.d(tag, "ML Kit ready: $initialSource → $targetLang")
                 DebugTimingLogger.logEvent(
@@ -114,6 +151,54 @@ class OcrTranslator(
                     mapOf("error" to t.message.orEmpty())
                 )
             }
+        }
+    }
+
+    private suspend fun ensureModelDownloaded(lang: String): Boolean {
+        if (lang == "en") return true
+
+        val cacheKey = "model:$lang"
+        modelReadyCache[cacheKey]?.let { return it }
+
+        val downloadedCache = Settings.getDownloadedModels(context)
+        if (downloadedCache.contains(lang)) {
+            modelReadyCache[cacheKey] = true
+            DebugTimingLogger.logEvent("android.translator_model_cached",
+                mapOf("lang" to lang))
+            return true
+        }
+
+        val model = TranslateRemoteModel.Builder(lang).build()
+
+        val alreadyDownloaded = try {
+            modelManager.isModelDownloaded(model).awaitT()
+        } catch (t: Throwable) {
+            Log.w(tag, "isModelDownloaded($lang) failed: ${t.message}")
+            false
+        }
+        if (alreadyDownloaded) {
+            modelReadyCache[cacheKey] = true
+            Settings.addDownloadedModel(context, lang)
+            DebugTimingLogger.logEvent("android.translator_model_already_present",
+                mapOf("lang" to lang))
+            return true
+        }
+
+        DebugTimingLogger.logEvent("android.translator_model_download_start",
+            mapOf("lang" to lang))
+        val conditions = DownloadConditions.Builder().build()
+        try {
+            modelManager.download(model, conditions).awaitT()
+            modelReadyCache[cacheKey] = true
+            Settings.addDownloadedModel(context, lang)
+            DebugTimingLogger.logEvent("android.translator_model_downloaded",
+                mapOf("lang" to lang))
+            return true
+        } catch (t: Throwable) {
+            Log.e(tag, "download($lang) failed: ${t.message}")
+            DebugTimingLogger.logEvent("android.translator_model_download_error",
+                mapOf("lang" to lang, "error" to t.message.orEmpty()))
+            return false
         }
     }
 
@@ -174,7 +259,7 @@ class OcrTranslator(
     }
 
     // ----------------------------------------------------------
-    // ML Kit (пул)
+    // ML Kit (пул) — прогрев всех translator'ов
     // ----------------------------------------------------------
 
     private suspend fun ensurePool(source: String, target: String) {
@@ -183,36 +268,61 @@ class OcrTranslator(
             if (translatorPool.containsKey(key)) return
         }
 
-        if (!isModelReady(source, target)) {
-            downloadModel(source, target)
-        }
         val options = TranslatorOptions.Builder()
             .setSourceLanguage(source)
             .setTargetLanguage(target)
             .build()
+
         val deque = ArrayDeque<Translator>(mlkitPoolSize)
         repeat(mlkitPoolSize) {
             deque.addLast(Translation.getClient(options))
         }
+
+        DebugTimingLogger.timed("android.translator_warmup",
+            mapOf("source" to source, "target" to target, "size" to mlkitPoolSize)) {
+            try {
+                withTimeoutOrNull(1500L) {
+                    coroutineScope {
+                        deque.map { translator ->
+                            async(Dispatchers.Default) {
+                                try {
+                                    translator.translate("a").awaitT()
+                                } catch (t: Throwable) {
+                                    Log.w(tag, "warmup $key failed: ${t.message}")
+                                }
+                            }
+                        }.awaitAll()
+                    }
+                }
+            } catch (t: Throwable) {
+                Log.w(tag, "warmup $key overall failed: ${t.message}")
+            }
+        }
+
         synchronized(poolLock) {
             translatorPool[key] = deque
         }
+        DebugTimingLogger.logEvent("android.translator_pool_ready",
+            mapOf("source" to source, "target" to target, "size" to mlkitPoolSize))
     }
 
-    /**
-     * Забирает переводчик из пула. Если свободных нет — создаёт временный
-     * (не кладёт в пул, чтобы не превысить размер).
-     */
+    // ИЗМЕНЕНО: ensurePool внутри borrowTranslator вызывается только
+    // если пула ещё нет — убираем повторный synchronized + проверку
+    // на каждом займе.
     private suspend fun borrowTranslator(source: String, target: String): Translator {
         val key = "$source->$target"
-        ensurePool(source, target)
+        // Быстрая проверка без suspend-вызова
+        val exists = synchronized(poolLock) { translatorPool.containsKey(key) }
+        if (!exists) {
+            ensurePool(source, target)
+        }
         synchronized(poolLock) {
             val deque = translatorPool[key]
             if (deque != null && deque.isNotEmpty()) {
                 return deque.removeFirst()
             }
         }
-        // Все заняты — создаём одноразовый
+        // Все заняты — создаём временный
         val options = TranslatorOptions.Builder()
             .setSourceLanguage(source)
             .setTargetLanguage(target)
@@ -236,61 +346,15 @@ class OcrTranslator(
         }
     }
 
-    private suspend fun isModelReady(source: String, target: String): Boolean {
-        val key = "$source->$target"
-        modelReadyCache[key]?.let { return it }
-
-        return DebugTimingLogger.timed("android.translator_is_model_ready") {
-            try {
-                val downloadedModels = modelManager
-                    .getDownloadedModels(TranslateRemoteModel::class.java)
-                    .awaitT()
-                val langs = downloadedModels.map { it.language }.toSet()
-                val ok = (source == "en" || langs.contains(source)) &&
-                        (target == "en" || langs.contains(target))
-                modelReadyCache[key] = ok
-                ok
-            } catch (t: Throwable) {
-                Log.e(tag, "isModelReady failed: ${t.message}")
-                false
-            }
-        }
-    }
-
-    private fun downloadModel(source: String, target: String) {
-        val key = "$source->$target"
-        if (source != "en") {
-            val m = TranslateRemoteModel.Builder(source).build()
-            modelManager.download(m, DownloadConditions.Builder().requireWifi().build())
-                .addOnSuccessListener {
-                    modelReadyCache[key] = true
-                    DebugTimingLogger.logEvent("android.translator_model_downloaded",
-                        mapOf("lang" to source))
-                }
-                .addOnFailureListener { e ->
-                    DebugTimingLogger.logEvent("android.translator_model_download_error",
-                        mapOf("lang" to source, "error" to e.message.orEmpty()))
-                }
-        }
-        if (target != "en") {
-            val m = TranslateRemoteModel.Builder(target).build()
-            modelManager.download(m, DownloadConditions.Builder().requireWifi().build())
-                .addOnSuccessListener {
-                    modelReadyCache[key] = true
-                    DebugTimingLogger.logEvent("android.translator_model_downloaded",
-                        mapOf("lang" to target))
-                }
-                .addOnFailureListener { e ->
-                    DebugTimingLogger.logEvent("android.translator_model_download_error",
-                        mapOf("lang" to target, "error" to e.message.orEmpty()))
-                }
-        }
-    }
-
+    // ИЗМЕНЕНО: если fixedSourceLang задан — возвращаем сразу.
+    // Если язык уже определён ранее в этой сессии — возвращаем из кэша
+    // без вызова ML Kit. Раньше identifyLanguage вызывался на каждый
+    // translateAll, что давало ~50 ms на батч.
     private suspend fun detectSourceLang(text: String): String {
         if (fixedSourceLang != null) {
             return TranslateLanguage.fromLanguageTag(fixedSourceLang) ?: TranslateLanguage.ENGLISH
         }
+        detectedSourceLangCache?.let { return it }
         sourceLangCache[text]?.let { return it }
 
         return DebugTimingLogger.timed("android.translator_detect_lang") {
@@ -304,6 +368,8 @@ class OcrTranslator(
             } else {
                 TranslateLanguage.fromLanguageTag(tagLang) ?: TranslateLanguage.ENGLISH
             }
+            // ИЗМЕНЕНО: запоминаем определённый язык на всю сессию
+            detectedSourceLangCache = lang
             if (sourceLangCache.size < 200) {
                 sourceLangCache[text] = lang
             }
@@ -349,7 +415,6 @@ class OcrTranslator(
             }
             if (toTranslate.isEmpty()) return result
 
-            // ---- Опциональный HTTP-путь ----
             val httpAllowed = useServer
                     && serverEndpoint.isNotBlank()
                     && httpFailures.get() < MAX_HTTP_FAILURES
@@ -381,14 +446,11 @@ class OcrTranslator(
                     DebugTimingLogger.logEvent("android.translator_http_fallback",
                         mapOf("fails" to fails))
                     if (fails >= MAX_HTTP_FAILURES) {
-                        Log.w(tag, "Too many HTTP failures — switching to ML Kit permanently")
-                        DebugTimingLogger.logEvent("android.translator_force_mlkit")
                         useServer = false
                     }
                 }
             }
 
-            // ---- ML Kit (параллельно) ----
             return DebugTimingLogger.timed(
                 "android.translator_translate_all_mlkit",
                 mapOf("count" to toTranslate.size)
@@ -402,13 +464,17 @@ class OcrTranslator(
                     return@timed result
                 }
 
-                // Параллельная обработка: на каждый текст берём свой переводчик из пула.
+                // ИЗМЕНЕНО: убедимся, что пул для определённого языка есть.
+                // detectedSourceLangCache мог вернуть язык, для которого пул
+                // ещё не создан (например, если prepare() прогревал en→ru,
+                // а определился de). ensurePool создаст его один раз.
+                ensurePool(sourceLang, targetLang)
+
                 val translated = coroutineScope {
                     toTranslate.map { t ->
                         async(Dispatchers.Default) {
                             var temp = false
                             val translator = borrowTranslator(sourceLang, targetLang)
-                            // Если вернули не из пула — временный (пул пуст)
                             temp = synchronized(poolLock) {
                                 val key = "$sourceLang->$targetLang"
                                 val deque = translatorPool[key]
@@ -416,7 +482,12 @@ class OcrTranslator(
                             }
                             try {
                                 val r = try {
-                                    translator.translate(t).awaitT()
+                                    // ИЗМЕНЕНО: таймаут увеличен с 500 до 1500 ms.
+                                    // 500 ms было мало: средний перевод 1 предложения
+                                    // ~390 ms (см. лог), при всплесках не укладывалось.
+                                    withTimeoutOrNull(1500L) {
+                                        translator.translate(t).awaitT()
+                                    }
                                 } catch (ex: Throwable) {
                                     Log.e(tag, "mlkit translate failed: ${ex.message}")
                                     null
@@ -464,6 +535,7 @@ class OcrTranslator(
         cache.clear()
         sourceLangCache.clear()
         modelReadyCache.clear()
+        detectedSourceLangCache = null
         ready.set(false)
     }
 }

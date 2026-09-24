@@ -14,6 +14,9 @@ object Settings {
     const val KEY_OVERLAY_ALPHA = "overlay_alpha"
     const val KEY_OCR_PADDING = "ocr_padding"
 
+    // Кэш скачанных моделей (Set<String> с кодами языков)
+    const val KEY_DOWNLOADED_MODELS = "downloaded_models"
+
     // --- Debug timing ---
     const val KEY_DEBUG_TIMING_ENABLED = "debug_timing_enabled"
     const val KEY_DEBUG_VERBOSE = "debug_verbose"
@@ -37,8 +40,6 @@ object Settings {
     const val DEFAULT_DEBUG_AGGREGATE_WINDOW_MS = 1000L
 
     const val DEFAULT_TRANSLATE_ENDPOINT = "http://localhost:5008/translate"
-    // ВАЖНО: по умолчанию переводим ЛОКАЛЬНО через ML Kit.
-    // Серверный перевод (ПК) включается вручную в настройках.
     const val DEFAULT_USE_SERVER_TRANSLATION = false
 
     fun prefs(context: Context): SharedPreferences =
@@ -69,15 +70,55 @@ object Settings {
     fun setOverlayAlpha(context: Context, value: Int) =
         prefs(context).edit { putInt(KEY_OVERLAY_ALPHA, value) }
 
+    /**
+     * Преобразует значение слайдера "Прозрачность фона перевода" (0..100)
+     * в alpha-канал фона (0..255).
+     *
+     * Слайдер управляет ПРОЗРАЧНОСТЬЮ:
+     *   0%   → alpha=255 (полностью непрозрачный фон)
+     *   100% → alpha=0   (полностью прозрачный фон, виден оригинальный текст)
+     */
     fun alphaFromPercent(percent: Int): Int {
         val p = percent.coerceIn(0, 100)
-        return p * 255 / 100
+        return (100 - p) * 255 / 100
     }
 
     fun getOcrPadding(context: Context): Int =
         prefs(context).getInt(KEY_OCR_PADDING, DEFAULT_OCR_PADDING)
     fun setOcrPadding(context: Context, value: Int) =
         prefs(context).edit { putInt(KEY_OCR_PADDING, value.coerceIn(0, 50)) }
+
+    // ---------- Кэш скачанных моделей ----------
+
+    /**
+     * Возвращает set языков, для которых модели уже скачаны.
+     * Используется, чтобы не проверять каждый раз через isModelDownloaded,
+     * что занимает ~700 мс.
+     */
+    fun getDownloadedModels(context: Context): Set<String> {
+        val p = prefs(context)
+        // Возвращаем копию, чтобы избежать ConcurrentModificationException
+        return try {
+            p.getStringSet(KEY_DOWNLOADED_MODELS, emptySet())?.toSet() ?: emptySet()
+        } catch (_: Throwable) {
+            emptySet()
+        }
+    }
+
+    fun addDownloadedModel(context: Context, lang: String) {
+        if (lang.isBlank() || lang == "en") return
+        val p = prefs(context)
+        val current = getDownloadedModels(context).toMutableSet()
+        if (current.add(lang)) {
+            p.edit { putStringSet(KEY_DOWNLOADED_MODELS, current) }
+        }
+    }
+
+    fun clearDownloadedModels(context: Context) {
+        prefs(context).edit { remove(KEY_DOWNLOADED_MODELS) }
+    }
+
+    // ---------- Debug timing ----------
 
     fun isDebugTimingEnabled(context: Context): Boolean =
         prefs(context).getBoolean(KEY_DEBUG_TIMING_ENABLED, DEFAULT_DEBUG_TIMING_ENABLED)

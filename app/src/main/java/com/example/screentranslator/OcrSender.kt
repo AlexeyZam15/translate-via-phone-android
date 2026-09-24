@@ -32,9 +32,10 @@ class OcrSender(private val pcUrl: String) {
         frameW: Int,
         frameH: Int,
         mode: String = "translate",
-        overlayAlpha: Int = 217
+        overlayAlpha: Int = 217,
+        force: Boolean = false
     ) {
-        if (result.blocks.isEmpty()) return
+        if (result.blocks.isEmpty() && !force) return
 
         val tBuild = System.nanoTime()
         val jsonStr: String

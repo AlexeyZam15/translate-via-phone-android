@@ -263,6 +263,8 @@ class OverlayService : Service(), SharedPreferences.OnSharedPreferenceChangeList
                     return@launch
                 }
 
+                // ИЗМЕНЕНО: при !translator.isReady() показываем debug-зоны
+                // (сырой OCR), а не пытаемся показать "перевод" из OCR-текста.
                 if (debugMode || translator?.isReady() != true) {
                     blockCount = filtered.size
                     DebugTimingLogger.timed("android.overlay_show_zones") {
