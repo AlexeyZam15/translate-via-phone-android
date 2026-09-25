@@ -39,6 +39,15 @@
             android:exported="false"
             android:foregroundServiceType="mediaProjection" />
 
+        <!-- Receiver для приёма настроек от ПК через ADB broadcast -->
+        <receiver
+            android:name=".SettingsReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="com.example.screentranslator.SETTINGS" />
+            </intent-filter>
+        </receiver>
+
     </application>
 
 </manifest>

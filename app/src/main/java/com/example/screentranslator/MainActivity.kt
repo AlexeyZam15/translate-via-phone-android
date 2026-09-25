@@ -1,10 +1,8 @@
 package com.example.screentranslator
 
 import android.content.Intent
-import android.net.Uri
 import android.os.Build
 import android.os.Bundle
-import android.provider.Settings as AndroidSettings
 import android.widget.Button
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
@@ -14,13 +12,8 @@ import androidx.appcompat.app.AppCompatActivity
  * Главный экран.
  *
  * ИЗМЕНЕНО:
- *   - Огромная кнопка START/STOP (зелёная/красная).
- *   - Кнопка-шестерёнка → SettingsActivity.
- *   - Убраны отдельные кнопки «Старт OCR ПК» / «Стоп OCR ПК».
- *
- * Логика:
- *   START → запускает PcOcrService (OCR ПК через MJPEG + HTTP).
- *   STOP  → останавливает PcOcrService.
+ *   - Принимает extra auto_start_ocr=true и сразу запускает PcOcrService
+ *     (используется при автозапуске с ПК).
  */
 class MainActivity : AppCompatActivity() {
 
@@ -42,7 +35,6 @@ class MainActivity : AppCompatActivity() {
         btnStartStop = findViewById(R.id.btnStartStop)
         btnSettings = findViewById(R.id.btnSettings)
 
-        // Начальное состояние
         updateButtonState()
 
         btnStartStop.setOnClickListener {
@@ -56,11 +48,22 @@ class MainActivity : AppCompatActivity() {
         btnSettings.setOnClickListener {
             startActivity(Intent(this, SettingsActivity::class.java))
         }
+
+        // Автозапуск OCR с ПК (extra auto_start_ocr=true)
+        val autoStart = intent?.getBooleanExtra(EXTRA_AUTO_START_OCR, false) == true
+        if (autoStart) {
+            DebugTimingLogger.logEvent("android.auto_start_ocr_received")
+            // Небольшая задержка, чтобы активити успела стать foreground
+            btnStartStop.postDelayed({
+                if (!isRunning) {
+                    startPcOcr()
+                }
+            }, 300)
+        }
     }
 
     override fun onResume() {
         super.onResume()
-        // При возврате из настроек обновляем кнопку (на случай смены настроек)
         updateButtonState()
     }
 
@@ -68,12 +71,14 @@ class MainActivity : AppCompatActivity() {
         if (isRunning) {
             btnStartStop.text = "СТОП"
             btnStartStop.setBackgroundColor(
-                androidx.core.content.ContextCompat.getColor(this, android.R.color.holo_red_dark)
+                androidx.core.content.ContextCompat.getColor(
+                    this, android.R.color.holo_red_dark)
             )
         } else {
             btnStartStop.text = "НАЧАТЬ"
             btnStartStop.setBackgroundColor(
-                androidx.core.content.ContextCompat.getColor(this, android.R.color.holo_green_dark)
+                androidx.core.content.ContextCompat.getColor(
+                    this, android.R.color.holo_green_dark)
             )
         }
     }
@@ -108,5 +113,9 @@ class MainActivity : AppCompatActivity() {
                 android.Manifest.permission.POST_NOTIFICATIONS
             )
         }
+    }
+
+    companion object {
+        const val EXTRA_AUTO_START_OCR = "auto_start_ocr"
     }
 }

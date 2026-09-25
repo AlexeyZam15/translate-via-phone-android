@@ -27,8 +27,11 @@ object Settings {
     const val KEY_TRANSLATE_ENDPOINT = "translate_endpoint"
     const val KEY_USE_SERVER_TRANSLATION = "use_server_translation"
 
-    // ИЗМЕНЕНО: выбор движка перевода
-    const val KEY_TRANSLATE_ENGINE = "translate_engine"
+    // Профиль качества перевода (speed/balanced/quality)
+    const val KEY_TRANSLATE_PROFILE = "translate_profile"
+
+    // Автозапуск Android-приложения с ПК
+    const val KEY_AUTO_LAUNCH_ANDROID = "auto_launch_android"
 
     const val DEFAULT_DEBUG = false
     const val DEFAULT_CONFIDENCE = 42
@@ -43,10 +46,13 @@ object Settings {
     const val DEFAULT_DEBUG_AGGREGATE_WINDOW_MS = 1000L
 
     const val DEFAULT_TRANSLATE_ENDPOINT = "http://localhost:5008/translate"
+    const val DEFAULT_SETTINGS_ENDPOINT = "http://localhost:5009/settings"
     const val DEFAULT_USE_SERVER_TRANSLATION = false
 
-    // "auto" — HTTP + fallback на ML Kit, "http" — только HTTP, "mlkit" — только ML Kit
-    const val DEFAULT_TRANSLATE_ENGINE = "auto"
+    // Профиль качества по умолчанию — "Баланс"
+    const val DEFAULT_TRANSLATE_PROFILE = "balanced"
+
+    const val DEFAULT_AUTO_LAUNCH_ANDROID = true
 
     fun prefs(context: Context): SharedPreferences =
         context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
@@ -135,23 +141,36 @@ object Settings {
     fun setTranslateEndpoint(context: Context, value: String) =
         prefs(context).edit { putString(KEY_TRANSLATE_ENDPOINT, value) }
 
+    fun getSettingsEndpoint(context: Context): String =
+        DEFAULT_SETTINGS_ENDPOINT
+
     fun isUseServerTranslation(context: Context): Boolean =
         prefs(context).getBoolean(KEY_USE_SERVER_TRANSLATION, DEFAULT_USE_SERVER_TRANSLATION)
     fun setUseServerTranslation(context: Context, value: Boolean) =
         prefs(context).edit { putBoolean(KEY_USE_SERVER_TRANSLATION, value) }
 
-    // ---------- Translate engine ----------
+    // ---------- Translate profile ----------
 
     /**
-     * Возвращает текущий движок перевода:
-     *   "auto"  — HTTP (CTranslate2) с fallback на ML Kit (по умолчанию)
-     *   "http"  — только HTTP (CTranslate2)
-     *   "mlkit" — только ML Kit
+     * Возвращает текущий профиль качества перевода:
+     *   "speed"    — самый быстрый (beam_size=1, max_len=128)
+     *   "balanced" — баланс (beam_size=3, max_len=192) — по умолчанию
+     *   "quality"  — максимальное качество (beam_size=5, max_len=256)
+     *
+     * ML Kit всегда используется как fallback, если CTranslate2 недоступен.
      */
-    fun getTranslateEngine(context: Context): String =
-        prefs(context).getString(KEY_TRANSLATE_ENGINE, DEFAULT_TRANSLATE_ENGINE)
-            ?: DEFAULT_TRANSLATE_ENGINE
+    fun getTranslateProfile(context: Context): String =
+        prefs(context).getString(KEY_TRANSLATE_PROFILE, DEFAULT_TRANSLATE_PROFILE)
+            ?: DEFAULT_TRANSLATE_PROFILE
 
-    fun setTranslateEngine(context: Context, value: String) =
-        prefs(context).edit { putString(KEY_TRANSLATE_ENGINE, value) }
+    fun setTranslateProfile(context: Context, value: String) =
+        prefs(context).edit { putString(KEY_TRANSLATE_PROFILE, value) }
+
+    // ---------- Auto launch Android ----------
+
+    fun getAutoLaunchAndroid(context: Context): Boolean =
+        prefs(context).getBoolean(KEY_AUTO_LAUNCH_ANDROID, DEFAULT_AUTO_LAUNCH_ANDROID)
+
+    fun setAutoLaunchAndroid(context: Context, value: Boolean) =
+        prefs(context).edit { putBoolean(KEY_AUTO_LAUNCH_ANDROID, value) }
 }

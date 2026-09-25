@@ -1,7 +1,5 @@
 package com.example.screentranslator
 
-import android.content.Intent
-import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -18,6 +16,16 @@ import com.google.mlkit.common.model.DownloadConditions
 import com.google.mlkit.common.model.RemoteModelManager
 import com.google.mlkit.nl.translate.TranslateLanguage
 import com.google.mlkit.nl.translate.TranslateRemoteModel
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
+import org.json.JSONObject
+import java.util.concurrent.TimeUnit
 
 class SettingsActivity : AppCompatActivity() {
 
@@ -30,7 +38,7 @@ class SettingsActivity : AppCompatActivity() {
     private lateinit var textOverlayAlphaValue: TextView
     private lateinit var spinnerSourceLang: Spinner
     private lateinit var spinnerTargetLang: Spinner
-    private lateinit var spinnerTranslateEngine: Spinner
+    private lateinit var spinnerTranslateProfile: Spinner
     private lateinit var textModelStatus: TextView
     private lateinit var btnDownloadModel: Button
 
@@ -39,6 +47,16 @@ class SettingsActivity : AppCompatActivity() {
     private val uiHandler = Handler(Looper.getMainLooper())
     private var pendingAlphaSave: Runnable? = null
     private var pendingPaddingSave: Runnable? = null
+    private var pendingPushToPc: Runnable? = null
+
+    private val httpClient = OkHttpClient.Builder()
+        .connectTimeout(1500, TimeUnit.MILLISECONDS)
+        .readTimeout(3000, TimeUnit.MILLISECONDS)
+        .writeTimeout(3000, TimeUnit.MILLISECONDS)
+        .build()
+    private val jsonMedia = "application/json; charset=utf-8".toMediaType()
+
+    @Volatile private var suppressCallbacks = false
 
     private val sourceLanguages = listOf(
         null to "Автоопределение",
@@ -73,11 +91,11 @@ class SettingsActivity : AppCompatActivity() {
         "uk" to "Українська"
     )
 
-    // ИЗМЕНЕНО: движки перевода
-    private val translateEngines = listOf(
-        "auto" to "Auto (HTTP + ML Kit fallback)",
-        "http" to "HTTP (CTranslate2)",
-        "mlkit" to "ML Kit (on-device)"
+    // Профили качества перевода CTranslate2
+    private val translateProfiles = listOf(
+        "speed" to "Скорость",
+        "balanced" to "Баланс",
+        "quality" to "Качество"
     )
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -96,7 +114,7 @@ class SettingsActivity : AppCompatActivity() {
         textOverlayAlphaValue = findViewById(R.id.textOverlayAlphaValue)
         spinnerSourceLang = findViewById(R.id.spinnerSourceLang)
         spinnerTargetLang = findViewById(R.id.spinnerTargetLang)
-        spinnerTranslateEngine = findViewById(R.id.spinnerTranslateEngine)
+        spinnerTranslateProfile = findViewById(R.id.spinnerTranslateProfile)
         textModelStatus = findViewById(R.id.textModelStatus)
         btnDownloadModel = findViewById(R.id.btnDownloadModel)
 
@@ -116,48 +134,84 @@ class SettingsActivity : AppCompatActivity() {
         tgtAdapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
         spinnerTargetLang.adapter = tgtAdapter
 
-        // Translate engine
-        val engAdapter = ArrayAdapter(
+        // Translate profile
+        val profAdapter = ArrayAdapter(
             this, android.R.layout.simple_spinner_item,
-            translateEngines.map { it.second }
+            translateProfiles.map { it.second }
         )
-        engAdapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
-        spinnerTranslateEngine.adapter = engAdapter
+        profAdapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
+        spinnerTranslateProfile.adapter = profAdapter
 
-        // Загрузка текущих значений
-        checkDebug.isChecked = Settings.isDebug(this)
-        seekConfidence.progress = Settings.getConfidence(this)
-        seekOcrPadding.progress = Settings.getOcrPadding(this)
-        seekOverlayAlpha.progress = Settings.getOverlayAlpha(this)
+        bindControlsFromPrefs()
+        setupListeners()
+        checkModelStatus(currentTargetLang())
 
-        updateConfidenceLabel(seekConfidence.progress)
-        updateOcrPaddingLabel(seekOcrPadding.progress)
-        updateAlphaLabel(seekOverlayAlpha.progress)
+        // Синхронизация с ПК — забрать настройки
+        loadSettingsFromPcAsync()
+    }
 
-        val savedSource = Settings.getSourceLang(this)
-        val srcIndex = sourceLanguages.indexOfFirst { (code, _) ->
-            (code ?: "") == savedSource
-        }.coerceAtLeast(0)
-        spinnerSourceLang.setSelection(srcIndex)
+    override fun onSupportNavigateUp(): Boolean {
+        finish()
+        return true
+    }
 
-        val savedTarget = Settings.getTargetLang(this)
-        val tgtIndex = targetLanguages.indexOfFirst { it.first == savedTarget }.coerceAtLeast(0)
-        spinnerTargetLang.setSelection(tgtIndex)
+    override fun onDestroy() {
+        pendingAlphaSave?.let { uiHandler.removeCallbacks(it) }
+        pendingPaddingSave?.let { uiHandler.removeCallbacks(it) }
+        pendingPushToPc?.let { uiHandler.removeCallbacks(it) }
+        super.onDestroy()
+    }
 
-        val savedEngine = Settings.getTranslateEngine(this)
-        val engIndex = translateEngines.indexOfFirst { it.first == savedEngine }
-            .coerceAtLeast(0)
-        spinnerTranslateEngine.setSelection(engIndex)
+    // ---------- Привязка значений из prefs ----------
 
-        // Слушатели
+    private fun bindControlsFromPrefs() {
+        suppressCallbacks = true
+        try {
+            checkDebug.isChecked = Settings.isDebug(this)
+            seekConfidence.progress = Settings.getConfidence(this)
+            seekOcrPadding.progress = Settings.getOcrPadding(this)
+            seekOverlayAlpha.progress = Settings.getOverlayAlpha(this)
+
+            updateConfidenceLabel(seekConfidence.progress)
+            updateOcrPaddingLabel(seekOcrPadding.progress)
+            updateAlphaLabel(seekOverlayAlpha.progress)
+
+            val savedSource = Settings.getSourceLang(this)
+            val srcIndex = sourceLanguages.indexOfFirst { (code, _) ->
+                (code ?: "") == savedSource
+            }.coerceAtLeast(0)
+            spinnerSourceLang.setSelection(srcIndex)
+
+            val savedTarget = Settings.getTargetLang(this)
+            val tgtIndex = targetLanguages.indexOfFirst { it.first == savedTarget }
+                .coerceAtLeast(0)
+            spinnerTargetLang.setSelection(tgtIndex)
+
+            val savedProfile = Settings.getTranslateProfile(this)
+            val profIndex = translateProfiles.indexOfFirst { it.first == savedProfile }
+                .coerceAtLeast(0)
+            spinnerTranslateProfile.setSelection(profIndex)
+        } finally {
+            suppressCallbacks = false
+        }
+    }
+
+    // ---------- Слушатели ----------
+
+    private fun setupListeners() {
         checkDebug.setOnCheckedChangeListener { _, isChecked ->
+            if (suppressCallbacks) return@setOnCheckedChangeListener
             Settings.setDebug(this, isChecked)
+            schedulePushToPc()
         }
 
         seekConfidence.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
             override fun onProgressChanged(sb: SeekBar?, progress: Int, fromUser: Boolean) {
                 updateConfidenceLabel(progress)
-                if (fromUser) Settings.setConfidence(this@SettingsActivity, progress)
+                if (fromUser && !suppressCallbacks) {
+                    Settings.setConfidence(this@SettingsActivity, progress)
+                    schedulePushToPc()
+                }
             }
             override fun onStartTrackingTouch(sb: SeekBar?) {}
             override fun onStopTrackingTouch(sb: SeekBar?) {}
@@ -166,13 +220,14 @@ class SettingsActivity : AppCompatActivity() {
         seekOcrPadding.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
             override fun onProgressChanged(sb: SeekBar?, progress: Int, fromUser: Boolean) {
                 updateOcrPaddingLabel(progress)
-                if (!fromUser) return
+                if (!fromUser || suppressCallbacks) return
                 pendingPaddingSave?.let { uiHandler.removeCallbacks(it) }
                 val r = Runnable {
                     Settings.setOcrPadding(this@SettingsActivity, progress)
+                    schedulePushToPc()
                 }
                 pendingPaddingSave = r
-                uiHandler.postDelayed(r, 1000)
+                uiHandler.postDelayed(r, 500)
             }
             override fun onStartTrackingTouch(sb: SeekBar?) {}
             override fun onStopTrackingTouch(sb: SeekBar?) {}
@@ -181,10 +236,11 @@ class SettingsActivity : AppCompatActivity() {
         seekOverlayAlpha.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
             override fun onProgressChanged(sb: SeekBar?, progress: Int, fromUser: Boolean) {
                 updateAlphaLabel(progress)
-                if (!fromUser) return
+                if (!fromUser || suppressCallbacks) return
                 pendingAlphaSave?.let { uiHandler.removeCallbacks(it) }
                 val r = Runnable {
                     Settings.setOverlayAlpha(this@SettingsActivity, progress)
+                    schedulePushToPc()
                 }
                 pendingAlphaSave = r
                 uiHandler.postDelayed(r, 300)
@@ -198,8 +254,10 @@ class SettingsActivity : AppCompatActivity() {
                 parent: AdapterView<*>?, view: android.view.View?,
                 position: Int, id: Long
             ) {
+                if (suppressCallbacks) return
                 val code = sourceLanguages[position].first ?: ""
                 Settings.setSourceLang(this@SettingsActivity, code)
+                schedulePushToPc()
             }
             override fun onNothingSelected(parent: AdapterView<*>?) {}
         }
@@ -209,20 +267,24 @@ class SettingsActivity : AppCompatActivity() {
                 parent: AdapterView<*>?, view: android.view.View?,
                 position: Int, id: Long
             ) {
+                if (suppressCallbacks) return
                 val code = targetLanguages[position].first
                 Settings.setTargetLang(this@SettingsActivity, code)
                 checkModelStatus(code)
+                schedulePushToPc()
             }
             override fun onNothingSelected(parent: AdapterView<*>?) {}
         }
 
-        spinnerTranslateEngine.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+        spinnerTranslateProfile.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
             override fun onItemSelected(
                 parent: AdapterView<*>?, view: android.view.View?,
                 position: Int, id: Long
             ) {
-                val engine = translateEngines[position].first
-                Settings.setTranslateEngine(this@SettingsActivity, engine)
+                if (suppressCallbacks) return
+                val profile = translateProfiles[position].first
+                Settings.setTranslateProfile(this@SettingsActivity, profile)
+                schedulePushToPc()
             }
             override fun onNothingSelected(parent: AdapterView<*>?) {}
         }
@@ -230,20 +292,118 @@ class SettingsActivity : AppCompatActivity() {
         btnDownloadModel.setOnClickListener {
             downloadModel(currentTargetLang())
         }
-
-        checkModelStatus(currentTargetLang())
     }
 
-    override fun onSupportNavigateUp(): Boolean {
-        finish()
-        return true
+    // ---------- Синхронизация с ПК ----------
+
+    private fun loadSettingsFromPcAsync() {
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                val endpoint = Settings.getSettingsEndpoint(this@SettingsActivity)
+                val req = Request.Builder().url(endpoint).get().build()
+                httpClient.newCall(req).execute().use { resp ->
+                    if (!resp.isSuccessful) return@launch
+                    val text = resp.body?.string() ?: return@launch
+                    val obj = JSONObject(text)
+                    withContext(Dispatchers.Main) {
+                        applySettingsFromJson(obj)
+                    }
+                }
+            } catch (_: Exception) {
+                // ПК недоступен — работаем с локальными
+            }
+        }
     }
 
-    override fun onDestroy() {
-        pendingAlphaSave?.let { uiHandler.removeCallbacks(it) }
-        pendingPaddingSave?.let { uiHandler.removeCallbacks(it) }
-        super.onDestroy()
+    private fun applySettingsFromJson(obj: JSONObject) {
+        suppressCallbacks = true
+        try {
+            if (obj.has("debug")) {
+                val v = obj.optBoolean("debug", Settings.isDebug(this))
+                checkDebug.isChecked = v
+                Settings.setDebug(this, v)
+            }
+            if (obj.has("translate_profile")) {
+                val p = obj.optString("translate_profile",
+                    Settings.getTranslateProfile(this))
+                val idx = translateProfiles.indexOfFirst { it.first == p }.coerceAtLeast(0)
+                spinnerTranslateProfile.setSelection(idx)
+                Settings.setTranslateProfile(this, p)
+            }
+            if (obj.has("confidence")) {
+                val v = obj.optInt("confidence", Settings.getConfidence(this))
+                seekConfidence.progress = v
+                updateConfidenceLabel(v)
+                Settings.setConfidence(this, v)
+            }
+            if (obj.has("ocr_padding")) {
+                val v = obj.optInt("ocr_padding", Settings.getOcrPadding(this))
+                seekOcrPadding.progress = v
+                updateOcrPaddingLabel(v)
+                Settings.setOcrPadding(this, v)
+            }
+            if (obj.has("overlay_alpha")) {
+                val v = obj.optInt("overlay_alpha", Settings.getOverlayAlpha(this))
+                seekOverlayAlpha.progress = v
+                updateAlphaLabel(v)
+                Settings.setOverlayAlpha(this, v)
+            }
+            if (obj.has("source_lang")) {
+                val v = obj.optString("source_lang", Settings.getSourceLang(this))
+                val idx = sourceLanguages.indexOfFirst { (code, _) ->
+                    (code ?: "") == v
+                }.coerceAtLeast(0)
+                spinnerSourceLang.setSelection(idx)
+                Settings.setSourceLang(this, v)
+            }
+            if (obj.has("target_lang")) {
+                val v = obj.optString("target_lang", Settings.getTargetLang(this))
+                val idx = targetLanguages.indexOfFirst { it.first == v }.coerceAtLeast(0)
+                spinnerTargetLang.setSelection(idx)
+                Settings.setTargetLang(this, v)
+            }
+            if (obj.has("auto_launch_android")) {
+                Settings.setAutoLaunchAndroid(this, obj.optBoolean("auto_launch_android"))
+            }
+        } catch (_: Exception) {
+        } finally {
+            suppressCallbacks = false
+        }
     }
+
+    private fun schedulePushToPc() {
+        if (suppressCallbacks) return
+        pendingPushToPc?.let { uiHandler.removeCallbacks(it) }
+        val r = Runnable { pushSettingsToPcAsync() }
+        pendingPushToPc = r
+        uiHandler.postDelayed(r, 300)
+    }
+
+    private fun pushSettingsToPcAsync() {
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                val endpoint = Settings.getSettingsEndpoint(this@SettingsActivity)
+                val obj = JSONObject().apply {
+                    put("debug", Settings.isDebug(this@SettingsActivity))
+                    put("translate_profile",
+                        Settings.getTranslateProfile(this@SettingsActivity))
+                    put("confidence", Settings.getConfidence(this@SettingsActivity))
+                    put("ocr_padding", Settings.getOcrPadding(this@SettingsActivity))
+                    put("overlay_alpha", Settings.getOverlayAlpha(this@SettingsActivity))
+                    put("source_lang", Settings.getSourceLang(this@SettingsActivity))
+                    put("target_lang", Settings.getTargetLang(this@SettingsActivity))
+                    put("auto_launch_android",
+                        Settings.getAutoLaunchAndroid(this@SettingsActivity))
+                }
+                val body = obj.toString().toRequestBody(jsonMedia)
+                val req = Request.Builder().url(endpoint).post(body).build()
+                httpClient.newCall(req).execute().use { /* ignore */ }
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    // ---------- Модель перевода ----------
 
     private fun currentTargetLang(): String {
         return targetLanguages[spinnerTargetLang.selectedItemPosition].first

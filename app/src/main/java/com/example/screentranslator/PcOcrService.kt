@@ -20,6 +20,10 @@ import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import org.json.JSONObject
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 
@@ -30,7 +34,6 @@ class PcOcrService : Service(), SharedPreferences.OnSharedPreferenceChangeListen
     private var ocrEngine: OcrEngine? = null
     private var sender: OcrSender? = null
 
-    // Всегда BenchmarkTranslator (CTranslate2 + ML Kit fallback)
     private var benchmarkTranslator: BenchmarkTranslator? = null
 
     private data class OcrJob(
@@ -65,7 +68,8 @@ class PcOcrService : Service(), SharedPreferences.OnSharedPreferenceChangeListen
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val engineName = intent?.getStringExtra(EXTRA_ENGINE) ?: OcrType.ML_KIT.name
-        engineType = runCatching { OcrType.valueOf(engineName) }.getOrDefault(OcrType.ML_KIT)
+        engineType = runCatching { OcrType.valueOf(engineName) }
+            .getOrDefault(OcrType.ML_KIT)
 
         DebugTimingLogger.init(applicationContext)
         DebugTimingLogger.logEvent("android.pc_ocr_service_start",
@@ -86,7 +90,10 @@ class PcOcrService : Service(), SharedPreferences.OnSharedPreferenceChangeListen
 
         startTranslationWorker()
 
-        // MJPEG стартует после prepare() (или таймаута 8 сек)
+        scope.launch {
+            loadSettingsFromPc()
+        }
+
         scope.launch {
             launch { benchmarkTranslator?.prepare() }
             withTimeoutOrNull(8000L) {
@@ -100,11 +107,66 @@ class PcOcrService : Service(), SharedPreferences.OnSharedPreferenceChangeListen
             mjpegReader?.start()
         }
 
-        Log.d(TAG, "PcOcrService started: CTranslate2+MLKit, " +
+        Log.d(TAG, "PcOcrService started: CTranslate2 + MLKit fallback, " +
                 "threshold=$confidenceThreshold, source=${sourceLang ?: "auto"}, " +
                 "target=$targetLang, debug=$debugMode, alpha=$overlayAlpha")
 
         return START_NOT_STICKY
+    }
+
+    private suspend fun loadSettingsFromPc() {
+        try {
+            val endpoint = Settings.getSettingsEndpoint(this)
+            val client = OkHttpClient.Builder()
+                .connectTimeout(1500, TimeUnit.MILLISECONDS)
+                .readTimeout(3000, TimeUnit.MILLISECONDS)
+                .build()
+            val req = Request.Builder().url(endpoint).get().build()
+            kotlinx.coroutines.withContext(Dispatchers.IO) {
+                client.newCall(req).execute().use { resp ->
+                    if (!resp.isSuccessful) return@use
+                    val text = resp.body?.string() ?: return@use
+                    val obj = JSONObject(text)
+                    if (obj.has("debug")) {
+                        Settings.setDebug(this@PcOcrService, obj.optBoolean("debug"))
+                    }
+                    if (obj.has("translate_profile")) {
+                        Settings.setTranslateProfile(this@PcOcrService,
+                            obj.optString("translate_profile"))
+                    }
+                    if (obj.has("confidence")) {
+                        Settings.setConfidence(this@PcOcrService,
+                            obj.optInt("confidence"))
+                    }
+                    if (obj.has("ocr_padding")) {
+                        Settings.setOcrPadding(this@PcOcrService,
+                            obj.optInt("ocr_padding"))
+                    }
+                    if (obj.has("overlay_alpha")) {
+                        Settings.setOverlayAlpha(this@PcOcrService,
+                            obj.optInt("overlay_alpha"))
+                    }
+                    if (obj.has("source_lang")) {
+                        Settings.setSourceLang(this@PcOcrService,
+                            obj.optString("source_lang"))
+                    }
+                    if (obj.has("target_lang")) {
+                        Settings.setTargetLang(this@PcOcrService,
+                            obj.optString("target_lang"))
+                    }
+                    DebugTimingLogger.logEvent("android.settings_loaded_from_pc")
+                }
+            }
+            loadSettings()
+            scope.launch {
+                benchmarkTranslator?.close()
+                benchmarkTranslator = BenchmarkTranslator(
+                    this@PcOcrService, targetLang, sourceLang)
+                benchmarkTranslator?.prepare()
+            }
+        } catch (_: Exception) {
+            DebugTimingLogger.logEvent("android.settings_load_from_pc_failed")
+        }
     }
 
     private fun startTranslationWorker() {
@@ -124,11 +186,15 @@ class PcOcrService : Service(), SharedPreferences.OnSharedPreferenceChangeListen
 
     private fun loadSettings() {
         debugMode = Settings.isDebug(this)
-        confidenceThreshold = Settings.getConfidence(this) / 100f
+        val conf = Settings.getConfidence(this)
+        confidenceThreshold = conf / 100f
         val srcRaw = Settings.getSourceLang(this)
-        sourceLang = if (srcRaw.isEmpty()) null else srcRaw
+        sourceLang = if (srcRaw.isEmpty() || srcRaw == "auto") null else srcRaw
         targetLang = Settings.getTargetLang(this)
         overlayAlpha = Settings.alphaFromPercent(Settings.getOverlayAlpha(this))
+        Log.d(TAG, "loadSettings: debug=$debugMode, confidence=$conf, " +
+                "threshold=$confidenceThreshold, source=${sourceLang ?: "auto"}, " +
+                "target=$targetLang, alpha=$overlayAlpha")
     }
 
     override fun onSharedPreferenceChanged(prefs: SharedPreferences?, key: String?) {
@@ -172,9 +238,21 @@ class PcOcrService : Service(), SharedPreferences.OnSharedPreferenceChangeListen
 
                 bitmap.recycle()
 
-                // Бенчмарк (ML Kit + HTTP), результат — HTTP или ML Kit fallback
-                if (result != null && result.blocks.isNotEmpty()) {
-                    val texts = result.blocks.map { it.text }
+                val filtered: List<OcrBlock> = if (result == null || result.blocks.isEmpty()) {
+                    emptyList()
+                } else {
+                    val out = ArrayList<OcrBlock>(result.blocks.size)
+                    for (b in result.blocks) {
+                        if (!isMeaningfulText(b.text)) continue
+                        if (confidenceThreshold > 0f &&
+                            b.confidence < confidenceThreshold) continue
+                        out.add(b)
+                    }
+                    out
+                }
+
+                if (result != null && filtered.isNotEmpty()) {
+                    val texts = filtered.map { it.text }
                     DebugTimingLogger.timed("android.pc_ocr_benchmark") {
                         benchmarkTranslator?.translateAll(texts)
                     }
@@ -195,27 +273,16 @@ class PcOcrService : Service(), SharedPreferences.OnSharedPreferenceChangeListen
                     return@launch
                 }
 
-                val job = if (result == null) {
+                val job = if (result == null || filtered.isEmpty()) {
                     if (lastSentBlocksCount > 0) {
                         lastSentBlocksCount = 0
                         lastMode = ""
-                        OcrJob(emptyList(), "", fw, fh, "translate", overlayAlpha, true)
+                        OcrJob(emptyList(), result?.text ?: "", fw, fh,
+                            "translate", overlayAlpha, true)
                     } else null
                 } else {
-                    val filtered = if (debugMode) result.blocks
-                    else if (confidenceThreshold > 0f) result.blocks.filter { it.confidence >= confidenceThreshold }
-                    else result.blocks
-
-                    if (filtered.isEmpty()) {
-                        if (lastSentBlocksCount > 0) {
-                            lastSentBlocksCount = 0
-                            lastMode = ""
-                            OcrJob(emptyList(), result.text, fw, fh, "translate", overlayAlpha, true)
-                        } else null
-                    } else {
-                        val mode = if (debugMode) "debug" else "translate"
-                        OcrJob(filtered, result.text, fw, fh, mode, overlayAlpha, false)
-                    }
+                    val mode = if (debugMode) "debug" else "translate"
+                    OcrJob(filtered, result.text, fw, fh, mode, overlayAlpha, false)
                 }
 
                 if (job != null) {
@@ -258,9 +325,6 @@ class PcOcrService : Service(), SharedPreferences.OnSharedPreferenceChangeListen
                 return
             }
 
-            // translate — используем BenchmarkTranslator.
-            // translateAll вернёт HTTP (CTranslate2), если он есть,
-            // иначе — ML Kit (fallback).
             val translated = benchmarkTranslator?.translateAll(
                 job.blocks.map { it.text }) ?: emptyList()
             val map = translated.toMap()
@@ -345,5 +409,243 @@ class PcOcrService : Service(), SharedPreferences.OnSharedPreferenceChangeListen
         private const val NOTIFICATION_ID = 2
         const val EXTRA_ENGINE = "engine"
         private const val COORD_BUCKET = 10
+
+        private val URL_REGEX = Regex(
+            """(https?://|www\.|[a-z0-9\-]+\.(com|ru|org|net|io|dev|edu|gov)\b)""",
+            RegexOption.IGNORE_CASE
+        )
+        private val LOG_REGEX = Regex("""^\[\d{2}:\d{2}:\d{2}]\s*(OCR|TR)\b""")
+
+        private const val VOWELS = "aeiouyAEIOUYаеёиоуыэюяАЕЁИОУЫЭЮЯ"
+
+        // Расширенный список частых английских биграмм.
+        private val ENG_BIGRAMS: Set<String> = hashSetOf(
+            // Базовые
+            "th", "he", "in", "er", "an", "re", "on", "at", "en", "nd",
+            "ti", "es", "or", "te", "of", "ed", "is", "it", "al", "ar",
+            "st", "to", "nt", "ng", "se", "ha", "as", "ou", "io", "le",
+            "ve", "co", "me", "de", "hi", "ri", "ro", "ic", "ne", "ea",
+            "ra", "ce", "li", "ch", "ll", "be", "ma", "si", "om", "ur",
+            "ay", "da", "od", "ad", "ai", "il", "ir", "el", "ly", "et",
+            "ee", "oo", "ie", "ue", "ui", "oa", "ta", "ac", "ca", "nc",
+            "no", "ot", "so", "us", "un", "up", "ut", "id", "im", "pe",
+            "po", "pr", "pl", "tr", "tw", "wh", "sh", "ck", "gh", "ph",
+            "qu", "ge", "gi", "gu", "ga", "go", "lo", "la", "lu", "mi",
+            "mu", "na", "ni", "nu", "ob", "oc", "op", "pa", "pi", "pu",
+            "sa", "sc", "sp", "su", "sy", "va", "vi", "vo", "wa", "we",
+            "wi", "wo", "ye", "yo", "za", "ze", "zo",
+            // Расширение: частые сочетания
+            "sl", "ep", "py", "ap", "pp", "ys", "em", "tt", "ty", "ow",
+            "bl", "cl", "fl", "gl", "br", "cr", "dr", "fr", "gr", "sw",
+            "sk", "sm", "sn", "sq", "str", "scr", "spr", "spl", "thr",
+            "shr", "squ", "ght", "igh", "ein", "eir", "our", "oul", "ous",
+            "ing", "ion", "ent", "ant", "and", "old", "ild", "ind", "ill",
+            "all", "ell", "oll", "ull", "ack", "eck", "ick", "ock", "uck",
+            "ace", "ice", "oce", "uce", "age", "ige", "oge", "uge",
+            "are", "ere", "ire", "ore", "ure", "ave", "eve", "ive", "ove",
+            "ate", "ite", "ote", "ute", "ame", "eme", "ime", "ome", "ume",
+            "ane", "ene", "ine", "one", "une", "ale", "ele", "ile", "ole",
+            "ape", "ipe", "ope", "ale", "ile", "ole", "ule"
+        )
+
+        // Английские суффиксы. Если слово оканчивается на суффикс —
+        // считаем его английским, биграммы не проверяем.
+        private val ENG_SUFFIXES: List<String> = listOf(
+            "ing", "ed", "ly", "er", "est", "tion", "sion", "ous", "ful",
+            "less", "able", "ible", "ment", "ness", "ity", "ty", "al",
+            "ic", "ive", "ish", "en", "an", "ary", "ory", "ize", "ise",
+            "ate", "y", "ies", "ied", "ier", "iest", "able", "ible"
+        )
+
+        /**
+         * Быстрый фильтр мусора OCR.
+         *
+         * Отсеивает:
+         *   • длину < 3;
+         *   • строки без букв;
+         *   • наши логи ([HH:MM:SS] OCR/TR);
+         *   • URL;
+         *   • > 40% не-буквенно-цифровых;
+         *   • смесь латиницы и кириллицы (латиницы > 30%);
+         *   • цифру между буквами;
+         *   • > 50% заглавных при длине >= 5;
+         *   • нет гласных в первых 20 символах;
+         *   • заглавную кириллицу после строчной кириллицы;
+         *   • латинское слово длиной >= 5 с < 3 английскими биграммами
+         *     (если слово НЕ оканчивается на английский суффикс);
+         *   • латинское слово длиной >= 6 с 2+ заглавными не в первой позиции;
+         *   • слово длиной >= 4 с цифрой внутри.
+         *
+         * Работает быстро: ранние выходы, один проход по строке.
+         */
+        fun isMeaningfulText(raw: String): Boolean {
+            val t = raw.trim()
+            val n = t.length
+            if (n < 3) return false
+
+            var letters = 0
+            var digits = 0
+            var nonAlnum = 0
+            var latin = 0
+            var cyrillic = 0
+            var upper = 0
+            var hasLetter = false
+            var digitBetweenLetters = false
+            var prevWasLetter = false
+            var prevWasDigit = false
+
+            for (i in 0 until n) {
+                val c = t[i]
+                val isLetter = when {
+                    c in 'a'..'z' -> { latin++; true }
+                    c in 'A'..'Z' -> { latin++; upper++; true }
+                    c in 'а'..'я' || c in 'А'..'Я' -> {
+                        cyrillic++
+                        if (c in 'А'..'Я') upper++
+                        true
+                    }
+                    c == 'ё' || c == 'Ё' -> {
+                        cyrillic++
+                        if (c == 'Ё') upper++
+                        true
+                    }
+                    else -> false
+                }
+                val isDigit = c in '0'..'9'
+
+                if (isLetter) {
+                    letters++
+                    hasLetter = true
+                    if (prevWasDigit && i + 1 < n && t[i + 1].isLetter()) {
+                        digitBetweenLetters = true
+                    }
+                } else if (isDigit) {
+                    digits++
+                    if (prevWasLetter && i + 1 < n && t[i + 1].isLetter()) {
+                        digitBetweenLetters = true
+                    }
+                } else if (c != ' ' && c != '\t') {
+                    nonAlnum++
+                }
+
+                prevWasLetter = isLetter
+                prevWasDigit = isDigit
+            }
+
+            if (!hasLetter) return false
+
+            if (LOG_REGEX.containsMatchIn(t)) return false
+            if (URL_REGEX.containsMatchIn(t)) return false
+
+            if (digitBetweenLetters) return false
+
+            val totalNonSpace = letters + digits + nonAlnum
+            if (totalNonSpace > 0 && nonAlnum * 100 / totalNonSpace > 40) return false
+
+            if (latin > 0 && cyrillic > 0) {
+                val totalLetters = latin + cyrillic
+                if (latin * 100 / totalLetters > 30) return false
+            }
+
+            if (n >= 5 && letters > 0 && upper * 100 / letters > 50) return false
+
+            // Правило 11: заглавная кириллица после строчной кириллицы
+            for (i in 1 until n) {
+                val c = t[i]
+                val p = t[i - 1]
+                if ((c in 'А'..'Я' || c == 'Ё') && (p in 'а'..'я' || p == 'ё')) {
+                    return false
+                }
+            }
+
+            // Правило 12: для каждого латинского слова длиной >= 5 —
+            // проверяем суффикс (если есть — ок), иначе минимум 3 биграммы
+            // и не более 1 заглавной не в первой позиции.
+            // Правило 13: слово длиной >= 4 с цифрой внутри — отсеивать.
+            var wordStart = -1
+            var wordIsLatin = false
+            var wordHasDigit = false
+
+            for (i in 0 until n + 1) {
+                val c = if (i < n) t[i] else ' '
+                val isLetter = i < n && c.isLetter()
+                val isDigit = i < n && c in '0'..'9'
+                val isLatinLetter = i < n && (c in 'a'..'z' || c in 'A'..'Z')
+
+                if (isLetter || isDigit) {
+                    if (wordStart == -1) {
+                        wordStart = i
+                        wordIsLatin = true
+                        wordHasDigit = false
+                    }
+                    if (isDigit) {
+                        wordHasDigit = true
+                    }
+                    if (isLetter && !isLatinLetter) {
+                        wordIsLatin = false
+                    }
+                } else {
+                    if (wordStart != -1) {
+                        val wordLen = i - wordStart
+                        // Правило 13: цифра внутри слова длиной >= 4
+                        if (wordHasDigit && wordLen >= 4) {
+                            return false
+                        }
+                        // Правило 12: латинское слово длиной >= 5
+                        if (wordIsLatin && !wordHasDigit && wordLen >= 5) {
+                            val word = t.substring(wordStart, i).lowercase()
+                            // Проверка суффикса
+                            var hasSuffix = false
+                            for (suf in ENG_SUFFIXES) {
+                                if (word.endsWith(suf) && word.length > suf.length) {
+                                    hasSuffix = true
+                                    break
+                                }
+                            }
+                            if (!hasSuffix) {
+                                // Проверка биграмм
+                                var bigrams = 0
+                                var upperMid = 0
+                                var j = wordStart
+                                while (j < i - 1) {
+                                    val c1 = t[j].lowercaseChar()
+                                    val c2 = t[j + 1].lowercaseChar()
+                                    if (c1 in 'a'..'z' && c2 in 'a'..'z') {
+                                        val bi = "$c1$c2"
+                                        if (bi in ENG_BIGRAMS) {
+                                            bigrams++
+                                        }
+                                    }
+                                    j++
+                                }
+                                j = wordStart + 1
+                                while (j < i) {
+                                    if (t[j] in 'A'..'Z') upperMid++
+                                    j++
+                                }
+                                if (bigrams < 3) return false
+                                if (upperMid >= 2) return false
+                            }
+                        }
+                        wordStart = -1
+                        wordIsLatin = false
+                        wordHasDigit = false
+                    }
+                }
+            }
+
+            // Нет гласных в первых 20 символах
+            val checkLen = if (n < 20) n else 20
+            var hasVowel = false
+            for (i in 0 until checkLen) {
+                if (VOWELS.indexOf(t[i]) >= 0) {
+                    hasVowel = true
+                    break
+                }
+            }
+            if (!hasVowel) return false
+
+            return true
+        }
     }
 }
