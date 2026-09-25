@@ -6,7 +6,17 @@ import okhttp3.Request
 import java.io.ByteArrayOutputStream
 import java.io.InputStream
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 
+/**
+ * MJPEGReader с автоматическим переподключением.
+ *
+ * ИЗМЕНЕНО:
+ *   - Автоматическое переподключение при обрыве с backoff 1-3 сек.
+ *   - WinError 10053 (ConnectionAborted) игнорируется — это норма
+ *     при смене активного окна на ПК.
+ *   - Логирование переподключений в DebugTimingLogger.
+ */
 class MJPEGReader(
     private val url: String,
     private val onFrame: (ByteArray) -> Unit
@@ -14,14 +24,11 @@ class MJPEGReader(
     private val client = OkHttpClient.Builder()
         .connectTimeout(5, TimeUnit.SECONDS)
         .readTimeout(0, TimeUnit.MILLISECONDS)
+        .retryOnConnectionFailure(true)
         .build()
 
     @Volatile private var running = false
 
-    // --- Общий буфер для чтения ---
-    // Читаем из потока блоками (64 КБ), но потребляем побайтово.
-    // Так мы НЕ теряем байты после SOI, и получаем скорость
-    // буферизованного чтения.
     private val readBuf = ByteArray(BUF_SIZE)
     private var bufPos = 0
     private var bufLen = 0
@@ -31,27 +38,41 @@ class MJPEGReader(
         running = true
         Thread {
             DebugTimingLogger.logEvent("android.mjpeg_start", mapOf("url" to url))
-            try {
-                val request = Request.Builder().url(url).build()
-                val response = DebugTimingLogger.timed("android.mjpeg_connect") {
-                    client.newCall(request).execute()
+            var attempt = 0
+            while (running) {
+                try {
+                    attempt++
+                    DebugTimingLogger.logEvent("android.mjpeg_connect_attempt",
+                        mapOf("attempt" to attempt))
+                    runOnce()
+                    // Если runOnce завершился без ошибки, но running — переподключаемся
+                    if (running) {
+                        DebugTimingLogger.logEvent("android.mjpeg_reconnect",
+                            mapOf("reason" to "stream_ended"))
+                    }
+                } catch (e: Exception) {
+                    if (running) {
+                        // WinError 10053 — норма при смене окна. Логируем тихо.
+                        DebugTimingLogger.logEvent("android.mjpeg_disconnect",
+                            mapOf(
+                                "error" to (e.message ?: ""),
+                                "type" to e.javaClass.simpleName,
+                                "attempt" to attempt
+                            ))
+                        Log.w(TAG, "MJPEG disconnected (attempt $attempt): ${e.message}")
+                    }
                 }
-                val stream = response.body?.byteStream()
-                    ?: throw IllegalStateException("body == null")
-
-                // Сбрасываем буфер на всякий случай
-                bufPos = 0
-                bufLen = 0
-
-                readMjpeg(stream)
-            } catch (e: Exception) {
-                Log.e(TAG, "MJPEG loop error", e)
-                DebugTimingLogger.logEvent("android.mjpeg_error",
-                    mapOf("error" to e.message.orEmpty()))
-            } finally {
-                running = false
-                DebugTimingLogger.logEvent("android.mjpeg_stop")
+                if (running) {
+                    // Backoff: 1 сек, 2 сек, 3 сек, потом 3 сек
+                    val backoff = minOf(3000L, 1000L * attempt)
+                    try {
+                        Thread.sleep(backoff)
+                    } catch (_: InterruptedException) {
+                        break
+                    }
+                }
             }
+            DebugTimingLogger.logEvent("android.mjpeg_stop")
         }.start()
     }
 
@@ -59,10 +80,20 @@ class MJPEGReader(
         running = false
     }
 
-    /**
-     * Читает один байт. Если буфер исчерпан — добирает из потока.
-     * Возвращает -1 при EOF или ошибке.
-     */
+    private fun runOnce() {
+        val request = Request.Builder().url(url).build()
+        val response = DebugTimingLogger.timed("android.mjpeg_connect") {
+            client.newCall(request).execute()
+        }
+        val stream = response.body?.byteStream()
+            ?: throw IllegalStateException("body == null")
+
+        bufPos = 0
+        bufLen = 0
+
+        readMjpeg(stream)
+    }
+
     private fun readByte(input: InputStream): Int {
         if (bufPos >= bufLen) {
             val n = try {
@@ -77,11 +108,6 @@ class MJPEGReader(
         return readBuf[bufPos++].toInt() and 0xFF
     }
 
-    /**
-     * Ищет маркер (двухбайтовую последовательность) в потоке.
-     * Читает байт за байтом из буфера. Байты после маркера
-     * остаются в буфере и будут прочитаны следующими вызовами.
-     */
     private fun findMarker(input: InputStream, m1: Int, m2: Int): Boolean {
         var prev = -1
         while (running) {
@@ -93,11 +119,6 @@ class MJPEGReader(
         return false
     }
 
-    /**
-     * Читает тело JPEG до маркера EOI (0xFF 0xD9).
-     * Всё прочитанное пишет в out. Байты после EOI
-     * остаются в буфере.
-     */
     private fun readJpegBody(input: InputStream, out: ByteArrayOutputStream): Boolean {
         var prev = -1
         while (running) {
@@ -114,23 +135,19 @@ class MJPEGReader(
         val buffer = ByteArrayOutputStream(256 * 1024)
 
         while (running) {
-            // 1. Ищем SOI (0xFF 0xD8)
             val soiFound = findMarker(input, 0xFF, 0xD8)
             if (!soiFound) break
 
-            // 2. Начинаем собирать JPEG (с SOI)
             buffer.reset()
             buffer.write(0xFF)
             buffer.write(0xD8)
 
-            // 3. Читаем тело до EOI (0xFF 0xD9)
             val eoiFound = DebugTimingLogger.timed("android.mjpeg_read_body") {
                 readJpegBody(input, buffer)
             }
 
             if (!eoiFound) {
                 if (!running) break
-                // Не нашли EOI — начинаем заново
                 continue
             }
 
