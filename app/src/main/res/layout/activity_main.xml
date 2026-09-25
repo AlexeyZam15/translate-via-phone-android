@@ -1,173 +1,35 @@
 <?xml version="1.0" encoding="utf-8"?>
-<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+<RelativeLayout xmlns:android="http://schemas.android.com/apk/res/android"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
-    android:fillViewport="true">
+    android:background="#1e1e1e">
 
-    <LinearLayout
+    <!-- ИЗМЕНЕНО: огромная кнопка START/STOP на весь экран -->
+    <Button
+        android:id="@+id/btnStartStop"
         android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:orientation="vertical"
-        android:padding="24dp">
+        android:layout_height="match_parent"
+        android:layout_margin="24dp"
+        android:text="НАЧАТЬ"
+        android:textSize="48sp"
+        android:textStyle="bold"
+        android:textColor="#ffffff"
+        android:background="#4CAF50"
+        android:stateListAnimator="@null"
+        android:layout_centerInParent="true" />
 
-        <TextView
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:text="OCR-движок: ML Kit (2-pass)"
-            android:textSize="20sp"
-            android:layout_marginBottom="24dp"
-            android:layout_gravity="center_horizontal" />
+    <!-- ИЗМЕНЕНО: кнопка-шестерёнка в правом верхнем углу -->
+    <Button
+        android:id="@+id/btnSettings"
+        android:layout_width="64dp"
+        android:layout_height="64dp"
+        android:layout_alignParentTop="true"
+        android:layout_alignParentEnd="true"
+        android:layout_margin="16dp"
+        android:text="⚙"
+        android:textSize="32sp"
+        android:textColor="#ffffff"
+        android:background="#607D8B"
+        android:stateListAnimator="@null" />
 
-        <CheckBox
-            android:id="@+id/checkDebug"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="16dp"
-            android:text="Debug (показывать уверенность)" />
-
-        <TextView
-            android:id="@+id/textConfidenceValue"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="16dp"
-            android:text="Порог уверенности: 42%"
-            android:textSize="14sp"
-            android:gravity="center" />
-
-        <SeekBar
-            android:id="@+id/seekConfidence"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="4dp"
-            android:max="100"
-            android:progress="42" />
-
-        <TextView
-            android:id="@+id/textOcrPaddingValue"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="16dp"
-            android:text="Отступ OCR: 10%"
-            android:textSize="14sp"
-            android:gravity="center" />
-
-        <SeekBar
-            android:id="@+id/seekOcrPadding"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="4dp"
-            android:max="50"
-            android:progress="10" />
-
-        <TextView
-            android:id="@+id/textOverlayAlphaValue"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="16dp"
-            android:text="Прозрачность фона перевода: 85%"
-            android:textSize="14sp"
-            android:gravity="center" />
-
-        <SeekBar
-            android:id="@+id/seekOverlayAlpha"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="4dp"
-            android:max="100"
-            android:progress="85" />
-
-        <TextView
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="16dp"
-            android:text="Исходный язык:"
-            android:textSize="14sp" />
-
-        <Spinner
-            android:id="@+id/spinnerSourceLang"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="4dp" />
-
-        <TextView
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="16dp"
-            android:text="Язык перевода:"
-            android:textSize="14sp" />
-
-        <Spinner
-            android:id="@+id/spinnerTargetLang"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="4dp" />
-
-        <TextView
-            android:id="@+id/textModelStatus"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="8dp"
-            android:text="Модель перевода: проверка…"
-            android:textSize="13sp"
-            android:textColor="#666666" />
-
-        <Button
-            android:id="@+id/btnDownloadModel"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="8dp"
-            android:text="⬇ Скачать модель перевода" />
-
-        <Button
-            android:id="@+id/btnStart"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="32dp"
-            android:text="Старт (OCR экрана телефона)" />
-
-        <Button
-            android:id="@+id/btnStop"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="8dp"
-            android:text="Стоп (OCR экрана телефона)" />
-
-        <View
-            android:layout_width="match_parent"
-            android:layout_height="1dp"
-            android:background="#cccccc"
-            android:layout_marginTop="32dp"
-            android:layout_marginBottom="16dp" />
-
-        <TextView
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:text="OCR через ПК (MJPEG → ML Kit → bounding boxes на ПК)"
-            android:textSize="14sp"
-            android:textStyle="bold"
-            android:gravity="center"
-            android:layout_marginBottom="8dp" />
-
-        <TextView
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:text="Адрес ПК определяется автоматически через ADB (USB).\nПодключите телефон по USB и убедитесь, что на ПК запущена трансляция."
-            android:textSize="12sp"
-            android:textColor="#666666"
-            android:gravity="center"
-            android:layout_marginBottom="16dp" />
-
-        <Button
-            android:id="@+id/btnStartPcOcr"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:text="Старт OCR ПК" />
-
-        <Button
-            android:id="@+id/btnStopPcOcr"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="8dp"
-            android:text="Стоп OCR ПК" />
-    </LinearLayout>
-</ScrollView>
+</RelativeLayout>

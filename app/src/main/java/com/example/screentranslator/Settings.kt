@@ -27,12 +27,8 @@ object Settings {
     const val KEY_TRANSLATE_ENDPOINT = "translate_endpoint"
     const val KEY_USE_SERVER_TRANSLATION = "use_server_translation"
 
-    // --- Benchmark mode ---
-    const val KEY_BENCHMARK_MODE = "benchmark_mode"
-
-    // --- Zebra (Picovoice) ---
-    const val KEY_ZEBRA_ACCESS_KEY = "zebra_access_key"
-    const val KEY_ZEBRA_MODEL_PATH = "zebra_model_path"
+    // ИЗМЕНЕНО: выбор движка перевода
+    const val KEY_TRANSLATE_ENGINE = "translate_engine"
 
     const val DEFAULT_DEBUG = false
     const val DEFAULT_CONFIDENCE = 42
@@ -49,9 +45,8 @@ object Settings {
     const val DEFAULT_TRANSLATE_ENDPOINT = "http://localhost:5008/translate"
     const val DEFAULT_USE_SERVER_TRANSLATION = false
 
-    const val DEFAULT_BENCHMARK_MODE = false
-    const val DEFAULT_ZEBRA_ACCESS_KEY = ""
-    const val DEFAULT_ZEBRA_MODEL_PATH = ""
+    // "auto" — HTTP + fallback на ML Kit, "http" — только HTTP, "mlkit" — только ML Kit
+    const val DEFAULT_TRANSLATE_ENGINE = "auto"
 
     fun prefs(context: Context): SharedPreferences =
         context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
@@ -145,22 +140,18 @@ object Settings {
     fun setUseServerTranslation(context: Context, value: Boolean) =
         prefs(context).edit { putBoolean(KEY_USE_SERVER_TRANSLATION, value) }
 
-    // --- Benchmark mode ---
+    // ---------- Translate engine ----------
 
-    fun isBenchmarkMode(context: Context): Boolean =
-        prefs(context).getBoolean(KEY_BENCHMARK_MODE, DEFAULT_BENCHMARK_MODE)
-    fun setBenchmarkMode(context: Context, value: Boolean) =
-        prefs(context).edit { putBoolean(KEY_BENCHMARK_MODE, value) }
+    /**
+     * Возвращает текущий движок перевода:
+     *   "auto"  — HTTP (CTranslate2) с fallback на ML Kit (по умолчанию)
+     *   "http"  — только HTTP (CTranslate2)
+     *   "mlkit" — только ML Kit
+     */
+    fun getTranslateEngine(context: Context): String =
+        prefs(context).getString(KEY_TRANSLATE_ENGINE, DEFAULT_TRANSLATE_ENGINE)
+            ?: DEFAULT_TRANSLATE_ENGINE
 
-    fun getZebraAccessKey(context: Context): String =
-        prefs(context).getString(KEY_ZEBRA_ACCESS_KEY, DEFAULT_ZEBRA_ACCESS_KEY)
-            ?: DEFAULT_ZEBRA_ACCESS_KEY
-    fun setZebraAccessKey(context: Context, value: String) =
-        prefs(context).edit { putString(KEY_ZEBRA_ACCESS_KEY, value) }
-
-    fun getZebraModelPath(context: Context): String =
-        prefs(context).getString(KEY_ZEBRA_MODEL_PATH, DEFAULT_ZEBRA_MODEL_PATH)
-            ?: DEFAULT_ZEBRA_MODEL_PATH
-    fun setZebraModelPath(context: Context, value: String) =
-        prefs(context).edit { putString(KEY_ZEBRA_MODEL_PATH, value) }
+    fun setTranslateEngine(context: Context, value: String) =
+        prefs(context).edit { putString(KEY_TRANSLATE_ENGINE, value) }
 }
