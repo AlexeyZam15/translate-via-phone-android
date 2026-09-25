@@ -27,6 +27,13 @@ object Settings {
     const val KEY_TRANSLATE_ENDPOINT = "translate_endpoint"
     const val KEY_USE_SERVER_TRANSLATION = "use_server_translation"
 
+    // --- Benchmark mode ---
+    const val KEY_BENCHMARK_MODE = "benchmark_mode"
+
+    // --- Zebra (Picovoice) ---
+    const val KEY_ZEBRA_ACCESS_KEY = "zebra_access_key"
+    const val KEY_ZEBRA_MODEL_PATH = "zebra_model_path"
+
     const val DEFAULT_DEBUG = false
     const val DEFAULT_CONFIDENCE = 42
     const val DEFAULT_SOURCE_LANG = ""
@@ -41,6 +48,10 @@ object Settings {
 
     const val DEFAULT_TRANSLATE_ENDPOINT = "http://localhost:5008/translate"
     const val DEFAULT_USE_SERVER_TRANSLATION = false
+
+    const val DEFAULT_BENCHMARK_MODE = false
+    const val DEFAULT_ZEBRA_ACCESS_KEY = ""
+    const val DEFAULT_ZEBRA_MODEL_PATH = ""
 
     fun prefs(context: Context): SharedPreferences =
         context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
@@ -70,14 +81,6 @@ object Settings {
     fun setOverlayAlpha(context: Context, value: Int) =
         prefs(context).edit { putInt(KEY_OVERLAY_ALPHA, value) }
 
-    /**
-     * Преобразует значение слайдера "Прозрачность фона перевода" (0..100)
-     * в alpha-канал фона (0..255).
-     *
-     * Слайдер управляет ПРОЗРАЧНОСТЬЮ:
-     *   0%   → alpha=255 (полностью непрозрачный фон)
-     *   100% → alpha=0   (полностью прозрачный фон, виден оригинальный текст)
-     */
     fun alphaFromPercent(percent: Int): Int {
         val p = percent.coerceIn(0, 100)
         return (100 - p) * 255 / 100
@@ -88,16 +91,8 @@ object Settings {
     fun setOcrPadding(context: Context, value: Int) =
         prefs(context).edit { putInt(KEY_OCR_PADDING, value.coerceIn(0, 50)) }
 
-    // ---------- Кэш скачанных моделей ----------
-
-    /**
-     * Возвращает set языков, для которых модели уже скачаны.
-     * Используется, чтобы не проверять каждый раз через isModelDownloaded,
-     * что занимает ~700 мс.
-     */
     fun getDownloadedModels(context: Context): Set<String> {
         val p = prefs(context)
-        // Возвращаем копию, чтобы избежать ConcurrentModificationException
         return try {
             p.getStringSet(KEY_DOWNLOADED_MODELS, emptySet())?.toSet() ?: emptySet()
         } catch (_: Throwable) {
@@ -117,8 +112,6 @@ object Settings {
     fun clearDownloadedModels(context: Context) {
         prefs(context).edit { remove(KEY_DOWNLOADED_MODELS) }
     }
-
-    // ---------- Debug timing ----------
 
     fun isDebugTimingEnabled(context: Context): Boolean =
         prefs(context).getBoolean(KEY_DEBUG_TIMING_ENABLED, DEFAULT_DEBUG_TIMING_ENABLED)
@@ -151,4 +144,23 @@ object Settings {
         prefs(context).getBoolean(KEY_USE_SERVER_TRANSLATION, DEFAULT_USE_SERVER_TRANSLATION)
     fun setUseServerTranslation(context: Context, value: Boolean) =
         prefs(context).edit { putBoolean(KEY_USE_SERVER_TRANSLATION, value) }
+
+    // --- Benchmark mode ---
+
+    fun isBenchmarkMode(context: Context): Boolean =
+        prefs(context).getBoolean(KEY_BENCHMARK_MODE, DEFAULT_BENCHMARK_MODE)
+    fun setBenchmarkMode(context: Context, value: Boolean) =
+        prefs(context).edit { putBoolean(KEY_BENCHMARK_MODE, value) }
+
+    fun getZebraAccessKey(context: Context): String =
+        prefs(context).getString(KEY_ZEBRA_ACCESS_KEY, DEFAULT_ZEBRA_ACCESS_KEY)
+            ?: DEFAULT_ZEBRA_ACCESS_KEY
+    fun setZebraAccessKey(context: Context, value: String) =
+        prefs(context).edit { putString(KEY_ZEBRA_ACCESS_KEY, value) }
+
+    fun getZebraModelPath(context: Context): String =
+        prefs(context).getString(KEY_ZEBRA_MODEL_PATH, DEFAULT_ZEBRA_MODEL_PATH)
+            ?: DEFAULT_ZEBRA_MODEL_PATH
+    fun setZebraModelPath(context: Context, value: String) =
+        prefs(context).edit { putString(KEY_ZEBRA_MODEL_PATH, value) }
 }

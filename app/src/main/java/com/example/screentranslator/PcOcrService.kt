@@ -29,9 +29,10 @@ class PcOcrService : Service(), SharedPreferences.OnSharedPreferenceChangeListen
     private var mjpegReader: MJPEGReader? = null
     private var ocrEngine: OcrEngine? = null
     private var sender: OcrSender? = null
-    private var translator: OcrTranslator? = null
 
-    // OCR-задача для worker'а.
+    // Всегда BenchmarkTranslator (CTranslate2 + ML Kit fallback)
+    private var benchmarkTranslator: BenchmarkTranslator? = null
+
     private data class OcrJob(
         val blocks: List<OcrBlock>,
         val rawText: String,
@@ -42,13 +43,11 @@ class PcOcrService : Service(), SharedPreferences.OnSharedPreferenceChangeListen
         val isEmpty: Boolean
     )
 
-    // Очередь переводов. Буфер 2 — меньше устаревших задач.
     private val translationQueue = Channel<OcrJob>(capacity = 2)
     private var translationWorker: Job? = null
 
     private val ocrBusy = AtomicBoolean(false)
 
-    // Хэш блоков последней задачи в очереди — для дедупликации.
     @Volatile private var queuedHash: Int = 0
     @Volatile private var queuedMode: String = ""
 
@@ -59,9 +58,6 @@ class PcOcrService : Service(), SharedPreferences.OnSharedPreferenceChangeListen
     private var debugMode: Boolean = false
     private var overlayAlpha: Int = 217
 
-    // ИЗМЕНЕНО: сколько блоков реально было отправлено в прошлый раз.
-    // Нужно, чтобы понять, надо ли слать пустой job для очистки оверлея,
-    // когда переводчик ещё/уже не готов.
     @Volatile private var lastSentBlocksCount: Int = 0
     @Volatile private var lastMode: String = ""
 
@@ -85,30 +81,28 @@ class PcOcrService : Service(), SharedPreferences.OnSharedPreferenceChangeListen
 
         ocrEngine = OcrEngineFactory.create(this, engineType)
         sender = OcrSender(ocrUrl)
-        translator = OcrTranslator(this, targetLang, sourceLang)
+
+        benchmarkTranslator = BenchmarkTranslator(this, targetLang, sourceLang)
 
         startTranslationWorker()
 
-        // ИЗМЕНЕНО: MJPEG стартует после того, как переводчик готов
-        // (или по таймауту 5 сек). Пока переводчик не готов — onFrame
-        // всё равно ничего не отправляет (см. ниже), но так мы ещё и
-        // не тратим OCR-циклы на кадры, которые не переведутся.
+        // MJPEG стартует после prepare() (или таймаута 8 сек)
         scope.launch {
-            launch { translator?.prepare() }
-            withTimeoutOrNull(5000L) {
-                while (translator?.isReady() != true) {
-                    delay(50)
+            launch { benchmarkTranslator?.prepare() }
+            withTimeoutOrNull(8000L) {
+                while (benchmarkTranslator?.isReady() != true) {
+                    delay(100)
                 }
             }
-            DebugTimingLogger.logEvent("android.pc_ocr_translator_ready_check",
-                mapOf("ready" to (translator?.isReady() == true)))
+            DebugTimingLogger.logEvent("android.pc_ocr_benchmark_ready_check",
+                mapOf("ready" to (benchmarkTranslator?.isReady() == true)))
             mjpegReader = MJPEGReader(mjpegUrl) { jpegBytes -> onFrame(jpegBytes) }
             mjpegReader?.start()
         }
 
-        Log.d(TAG, "PcOcrService started: threshold=$confidenceThreshold, " +
-                "source=${sourceLang ?: "auto"}, target=$targetLang, " +
-                "debug=$debugMode, alpha=$overlayAlpha")
+        Log.d(TAG, "PcOcrService started: CTranslate2+MLKit, " +
+                "threshold=$confidenceThreshold, source=${sourceLang ?: "auto"}, " +
+                "target=$targetLang, debug=$debugMode, alpha=$overlayAlpha")
 
         return START_NOT_STICKY
     }
@@ -134,20 +128,17 @@ class PcOcrService : Service(), SharedPreferences.OnSharedPreferenceChangeListen
         val srcRaw = Settings.getSourceLang(this)
         sourceLang = if (srcRaw.isEmpty()) null else srcRaw
         targetLang = Settings.getTargetLang(this)
-        val newAlpha = Settings.alphaFromPercent(Settings.getOverlayAlpha(this))
-        if (newAlpha != overlayAlpha) {
-            Log.d(TAG, "overlayAlpha changed: $overlayAlpha -> $newAlpha")
-        }
-        overlayAlpha = newAlpha
+        overlayAlpha = Settings.alphaFromPercent(Settings.getOverlayAlpha(this))
     }
 
     override fun onSharedPreferenceChanged(prefs: SharedPreferences?, key: String?) {
         loadSettings()
         if (key == Settings.KEY_SOURCE_LANG || key == Settings.KEY_TARGET_LANG) {
             scope.launch {
-                translator?.close()
-                translator = OcrTranslator(this@PcOcrService, targetLang, sourceLang)
-                translator?.prepare()
+                benchmarkTranslator?.close()
+                benchmarkTranslator = BenchmarkTranslator(
+                    this@PcOcrService, targetLang, sourceLang)
+                benchmarkTranslator?.prepare()
             }
         }
     }
@@ -181,24 +172,25 @@ class PcOcrService : Service(), SharedPreferences.OnSharedPreferenceChangeListen
 
                 bitmap.recycle()
 
-                // ИЗМЕНЕНО: пока переводчик не готов и это не debug-режим —
-                // НЕ отправляем блоки вообще. Оверлей на ПК остаётся пустым.
-                // Если до этого что-то было отправлено (переводчик был готов,
-                // потом сбросился) — шлём пустой job для очистки оверлея.
-                val translatorReady = translator?.isReady() == true
-                if (!debugMode && !translatorReady) {
+                // Бенчмарк (ML Kit + HTTP), результат — HTTP или ML Kit fallback
+                if (result != null && result.blocks.isNotEmpty()) {
+                    val texts = result.blocks.map { it.text }
+                    DebugTimingLogger.timed("android.pc_ocr_benchmark") {
+                        benchmarkTranslator?.translateAll(texts)
+                    }
+                }
+
+                val benchmarkReady = benchmarkTranslator?.isReady() == true
+                if (!debugMode && !benchmarkReady) {
                     if (lastSentBlocksCount > 0) {
                         lastSentBlocksCount = 0
                         lastMode = ""
-                        val clearJob = OcrJob(
-                            blocks = emptyList(),
-                            rawText = "",
+                        translationQueue.trySend(OcrJob(
+                            blocks = emptyList(), rawText = "",
                             frameW = fw, frameH = fh,
-                            mode = "translate",
-                            overlayAlpha = overlayAlpha,
+                            mode = "translate", overlayAlpha = overlayAlpha,
                             isEmpty = true
-                        )
-                        translationQueue.trySend(clearJob)
+                        ))
                     }
                     return@launch
                 }
@@ -207,75 +199,38 @@ class PcOcrService : Service(), SharedPreferences.OnSharedPreferenceChangeListen
                     if (lastSentBlocksCount > 0) {
                         lastSentBlocksCount = 0
                         lastMode = ""
-                        OcrJob(
-                            blocks = emptyList(),
-                            rawText = "",
-                            frameW = fw, frameH = fh,
-                            mode = "translate",
-                            overlayAlpha = overlayAlpha,
-                            isEmpty = true
-                        )
+                        OcrJob(emptyList(), "", fw, fh, "translate", overlayAlpha, true)
                     } else null
                 } else {
-                    val filtered = if (debugMode) {
-                        result.blocks
-                    } else if (confidenceThreshold > 0f) {
-                        result.blocks.filter { it.confidence >= confidenceThreshold }
-                    } else {
-                        result.blocks
-                    }
+                    val filtered = if (debugMode) result.blocks
+                    else if (confidenceThreshold > 0f) result.blocks.filter { it.confidence >= confidenceThreshold }
+                    else result.blocks
 
                     if (filtered.isEmpty()) {
                         if (lastSentBlocksCount > 0) {
                             lastSentBlocksCount = 0
                             lastMode = ""
-                            OcrJob(
-                                blocks = emptyList(),
-                                rawText = result.text,
-                                frameW = fw, frameH = fh,
-                                mode = "translate",
-                                overlayAlpha = overlayAlpha,
-                                isEmpty = true
-                            )
+                            OcrJob(emptyList(), result.text, fw, fh, "translate", overlayAlpha, true)
                         } else null
                     } else {
-                        // Режим: debug или translate. "ocr" больше не нужен —
-                        // при !isReady() мы вообще ничего не шлём.
                         val mode = if (debugMode) "debug" else "translate"
-                        OcrJob(
-                            blocks = filtered,
-                            rawText = result.text,
-                            frameW = fw, frameH = fh,
-                            mode = mode,
-                            overlayAlpha = overlayAlpha,
-                            isEmpty = false
-                        )
+                        OcrJob(filtered, result.text, fw, fh, mode, overlayAlpha, false)
                     }
                 }
 
                 if (job != null) {
                     if (!job.isEmpty) {
                         val hash = computeBlocksHash(job.blocks, job.mode, job.overlayAlpha)
-                        if (hash == queuedHash && job.mode == queuedMode) {
-                            return@launch
-                        }
+                        if (hash == queuedHash && job.mode == queuedMode) return@launch
                         queuedHash = hash
                         queuedMode = job.mode
                     }
-
-                    val sent = translationQueue.trySend(job).isSuccess
-                    if (!sent) {
+                    if (!translationQueue.trySend(job).isSuccess) {
                         droppedCount.incrementAndGet()
-                        if (droppedCount.get() % 5 == 1) {
-                            DebugTimingLogger.logEvent("android.pc_ocr_queue_full",
-                                mapOf("blocks" to job.blocks.size, "dropped" to droppedCount.get()))
-                        }
                     }
                 }
             } catch (e: Exception) {
                 Log.e(TAG, "onFrame error", e)
-                DebugTimingLogger.logEvent("android.pc_ocr_cycle_error",
-                    mapOf("error" to e.message.orEmpty()))
             } finally {
                 ocrBusy.set(false)
             }
@@ -285,44 +240,29 @@ class PcOcrService : Service(), SharedPreferences.OnSharedPreferenceChangeListen
     private suspend fun processJob(job: OcrJob) {
         val tStart = System.nanoTime()
         var blockCount = 0
-        var sent = false
-
         try {
             if (job.isEmpty || job.blocks.isEmpty()) {
-                DebugTimingLogger.timed("android.pc_ocr_send_empty") {
-                    sender?.send(
-                        OcrResult(job.rawText, emptyList()),
-                        job.frameW, job.frameH,
-                        "translate", job.overlayAlpha,
-                        force = true
-                    )
-                }
+                sender?.send(OcrResult(job.rawText, emptyList()),
+                    job.frameW, job.frameH, "translate", job.overlayAlpha, force = true)
                 lastSentBlocksCount = 0
                 lastMode = ""
-                sent = true
                 return
             }
 
-            // debug — отправляем OCR-блоки как есть.
             if (job.mode == "debug") {
                 blockCount = job.blocks.size
-                DebugTimingLogger.timed("android.pc_ocr_send") {
-                    sender?.send(
-                        OcrResult(job.rawText, job.blocks),
-                        job.frameW, job.frameH,
-                        "debug", job.overlayAlpha
-                    )
-                }
+                sender?.send(OcrResult(job.rawText, job.blocks),
+                    job.frameW, job.frameH, "debug", job.overlayAlpha)
                 lastSentBlocksCount = job.blocks.size
                 lastMode = "debug"
-                sent = true
                 return
             }
 
-            // translate — переводим и отправляем.
-            val translated = DebugTimingLogger.timed("android.pc_ocr_translate_all") {
-                translator?.translateAll(job.blocks.map { it.text }) ?: emptyList()
-            }
+            // translate — используем BenchmarkTranslator.
+            // translateAll вернёт HTTP (CTranslate2), если он есть,
+            // иначе — ML Kit (fallback).
+            val translated = benchmarkTranslator?.translateAll(
+                job.blocks.map { it.text }) ?: emptyList()
             val map = translated.toMap()
             val outBlocks = job.blocks.mapNotNull { block ->
                 val t = map[block.text] ?: return@mapNotNull null
@@ -330,42 +270,22 @@ class PcOcrService : Service(), SharedPreferences.OnSharedPreferenceChangeListen
             }
 
             blockCount = outBlocks.size
-
             if (outBlocks.isEmpty()) {
-                DebugTimingLogger.timed("android.pc_ocr_send_empty") {
-                    sender?.send(
-                        OcrResult(job.rawText, emptyList()),
-                        job.frameW, job.frameH,
-                        "translate", job.overlayAlpha,
-                        force = true
-                    )
-                }
+                sender?.send(OcrResult(job.rawText, emptyList()),
+                    job.frameW, job.frameH, "translate", job.overlayAlpha, force = true)
                 lastSentBlocksCount = 0
                 lastMode = ""
-                sent = true
                 return
             }
 
-            DebugTimingLogger.timed("android.pc_ocr_send") {
-                sender?.send(
-                    OcrResult(job.rawText, outBlocks),
-                    job.frameW, job.frameH,
-                    "translate", job.overlayAlpha
-                )
-            }
+            sender?.send(OcrResult(job.rawText, outBlocks),
+                job.frameW, job.frameH, "translate", job.overlayAlpha)
             lastSentBlocksCount = outBlocks.size
             lastMode = "translate"
-            sent = true
         } finally {
             val ms = (System.nanoTime() - tStart) / 1_000_000.0
-            DebugTimingLogger.logTiming(
-                "android.pc_ocr_cycle_total", ms,
-                mapOf(
-                    "blocks" to blockCount,
-                    "mode" to job.mode,
-                    "sent" to sent
-                )
-            )
+            DebugTimingLogger.logTiming("android.pc_ocr_cycle_total", ms,
+                mapOf("blocks" to blockCount, "mode" to job.mode))
         }
     }
 
@@ -386,16 +306,14 @@ class PcOcrService : Service(), SharedPreferences.OnSharedPreferenceChangeListen
     private fun buildNotification(): Notification {
         val channelId = "pc_ocr"
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val channel = NotificationChannel(
-                channelId, "PC OCR", NotificationManager.IMPORTANCE_LOW
-            )
+            val channel = NotificationChannel(channelId, "PC OCR",
+                NotificationManager.IMPORTANCE_LOW)
             (getSystemService(NOTIFICATION_SERVICE) as NotificationManager)
                 .createNotificationChannel(channel)
         }
-        val mode = if (debugMode) "debug" else "translate"
         return NotificationCompat.Builder(this, channelId)
             .setContentTitle("ScreenTranslator")
-            .setContentText("OCR ПК активен ($mode, localhost через ADB)")
+            .setContentText("OCR ПК активен (CTranslate2 + ML Kit fallback)")
             .setSmallIcon(android.R.drawable.ic_menu_search)
             .setOngoing(true)
             .build()
@@ -414,11 +332,10 @@ class PcOcrService : Service(), SharedPreferences.OnSharedPreferenceChangeListen
         ocrEngine?.close()
         ocrEngine = null
         sender = null
-        translator?.close()
-        translator = null
+        benchmarkTranslator?.close()
+        benchmarkTranslator = null
         scope.coroutineContext[Job]?.cancel()
         super.onDestroy()
-        Log.d(TAG, "PcOcrService stopped")
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -427,8 +344,6 @@ class PcOcrService : Service(), SharedPreferences.OnSharedPreferenceChangeListen
         private const val TAG = "PcOcrService"
         private const val NOTIFICATION_ID = 2
         const val EXTRA_ENGINE = "engine"
-
-        // Округление координат в хэше: 10 px.
         private const val COORD_BUCKET = 10
     }
 }
