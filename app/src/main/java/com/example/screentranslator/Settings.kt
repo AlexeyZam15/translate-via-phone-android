@@ -37,7 +37,7 @@ object Settings {
     const val DEFAULT_CONFIDENCE = 42
     const val DEFAULT_SOURCE_LANG = ""
     const val DEFAULT_TARGET_LANG = "ru"
-    const val DEFAULT_OVERLAY_ALPHA = 85
+    const val DEFAULT_OVERLAY_ALPHA = 0
     const val DEFAULT_OCR_PADDING = 10
 
     const val DEFAULT_DEBUG_TIMING_ENABLED = true
@@ -151,14 +151,6 @@ object Settings {
 
     // ---------- Translate profile ----------
 
-    /**
-     * Возвращает текущий профиль качества перевода:
-     *   "speed"    — самый быстрый (beam_size=1, max_len=128)
-     *   "balanced" — баланс (beam_size=3, max_len=192) — по умолчанию
-     *   "quality"  — максимальное качество (beam_size=5, max_len=256)
-     *
-     * ML Kit всегда используется как fallback, если CTranslate2 недоступен.
-     */
     fun getTranslateProfile(context: Context): String =
         prefs(context).getString(KEY_TRANSLATE_PROFILE, DEFAULT_TRANSLATE_PROFILE)
             ?: DEFAULT_TRANSLATE_PROFILE

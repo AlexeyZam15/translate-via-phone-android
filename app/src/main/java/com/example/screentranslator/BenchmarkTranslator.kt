@@ -2,7 +2,12 @@ package com.example.screentranslator
 
 import android.content.Context
 import android.util.Log
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import okhttp3.ConnectionPool
 import okhttp3.MediaType.Companion.toMediaType
@@ -18,8 +23,12 @@ import java.util.concurrent.atomic.AtomicBoolean
  * Переводчик: HTTP (CTranslate2 на ПК) + ML Kit (fallback).
  *
  * ИЗМЕНЕНО:
- *   - Нет выбора движка. Всегда HTTP (CTranslate2), ML Kit — fallback.
- *   - Профиль качества (speed/balanced/quality) применяется на ПК.
+ *   - HTTP и ML Kit теперь независимы. isReady() = httpReady || mlkitReady.
+ *   - prepare() сначала быстро пингует PC-эндпоинт (порт 5008).
+ *     Если PC ответил — ready=true немедленно, ML Kit готовится в фоне.
+ *   - Если ни HTTP, ни ML Kit не готовы — раз в 3 секунды перепинг PC.
+ *   - HTTP-перевод больше не «отключается» при фейлах, просто пробуется снова.
+ *   - Логи: benchmark.http_ping_ok / fail, benchmark.mlkit_ready, benchmark.is_ready.
  */
 class BenchmarkTranslator(
     private val context: Context,
@@ -40,61 +49,140 @@ class BenchmarkTranslator(
         .build()
     private val jsonMedia = "application/json; charset=utf-8".toMediaType()
 
+    // Флаги готовности движков
+    private val httpReady = AtomicBoolean(false)
+    private val mlkitReady = AtomicBoolean(false)
     private val ready = AtomicBoolean(false)
 
-    @Volatile private var httpFailures = 0
-    @Volatile private var httpDisabledUntil = 0L
-    private val HTTP_FAILURE_LIMIT = 3
-    private val HTTP_DISABLE_MS = 30_000L
+    // Фоновый скоуп для ML Kit-подготовки и периодического перепинга
+    private val bgScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private var mlkitJob: Job? = null
+    private var pingJob: Job? = null
+
+    // Антифлуд логов
+    @Volatile private var lastPingLoggedOk = false
+    @Volatile private var pingAttempts = 0
 
     suspend fun prepare() {
-        mlkitTranslator.prepare()
-        ready.set(true)
+        // 1) Быстрый пинг PC-эндпоинта (порт 5008)
+        val httpOk = pingServer()
+        if (httpOk) {
+            httpReady.set(true)
+            ready.set(true)
+            DebugTimingLogger.logEvent("benchmark.http_ping_ok",
+                mapOf("endpoint" to Settings.getTranslateEndpoint(context)))
+            Log.d(tag, "HTTP translator READY (PC available)")
+        } else {
+            DebugTimingLogger.logEvent("benchmark.http_ping_fail",
+                mapOf("endpoint" to Settings.getTranslateEndpoint(context)))
+            Log.w(tag, "HTTP translator not available at start")
+        }
+
+        // 2) ML Kit готовим в фоне, не блокируя ready
+        mlkitJob?.cancel()
+        mlkitJob = bgScope.launch {
+            try {
+                mlkitTranslator.prepare()
+                if (mlkitTranslator.isReady()) {
+                    mlkitReady.set(true)
+                    ready.set(true)
+                    DebugTimingLogger.logEvent("benchmark.mlkit_ready")
+                    Log.d(tag, "ML Kit translator READY (background)")
+                } else {
+                    DebugTimingLogger.logEvent("benchmark.mlkit_not_ready")
+                    Log.w(tag, "ML Kit prepare finished but not ready")
+                }
+            } catch (t: Throwable) {
+                Log.w(tag, "ML Kit prepare failed: ${t.message}")
+                DebugTimingLogger.logEvent("benchmark.mlkit_prepare_error",
+                    mapOf("error" to (t.message ?: "")))
+            }
+        }
+
+        // 3) Если HTTP не готов — запускаем периодический перепинг
+        if (!httpOk) {
+            startHttpWatchdog()
+        }
+
+        DebugTimingLogger.logEvent("benchmark.is_ready",
+            mapOf("ready" to ready.get(),
+                "http" to httpReady.get(),
+                "mlkit" to mlkitReady.get()))
     }
 
-    fun isReady(): Boolean = ready.get() && mlkitTranslator.isReady()
+    private fun startHttpWatchdog() {
+        pingJob?.cancel()
+        pingJob = bgScope.launch {
+            while (!httpReady.get() && ready.get().not()) {
+                delay(3000L)
+                if (httpReady.get()) break
+                val ok = pingServer()
+                if (ok) {
+                    httpReady.set(true)
+                    ready.set(true)
+                    DebugTimingLogger.logEvent("benchmark.http_ping_late_ok",
+                        mapOf("attempts" to pingAttempts))
+                    Log.d(tag, "HTTP translator became READY (late)")
+                    break
+                } else {
+                    DebugTimingLogger.logEvent("benchmark.http_ping_late_fail",
+                        mapOf("attempts" to pingAttempts))
+                }
+            }
+        }
+    }
+
+    fun isReady(): Boolean = ready.get() && (httpReady.get() || mlkitReady.get())
 
     suspend fun translateAll(texts: List<String>): List<Pair<String, String>> {
         if (!ready.get() || texts.isEmpty()) return emptyList()
 
         DebugTimingLogger.logEvent("benchmark.start",
-            mapOf("count" to texts.size, "target" to targetLang))
+            mapOf("count" to texts.size, "target" to targetLang,
+                "http" to httpReady.get(), "mlkit" to mlkitReady.get()))
 
-        val (httpResult, _) = runHttp(texts)
-        if (httpResult.isNotEmpty()) {
+        // 1) HTTP первым, если готов
+        if (httpReady.get()) {
+            val (httpResult, _) = runHttp(texts)
+            if (httpResult.isNotEmpty()) {
+                DebugTimingLogger.logEvent("benchmark.done",
+                    mapOf("engines" to "http", "fallback" to false))
+                return httpResult
+            } else {
+                // HTTP был готов, но конкретный запрос провалился.
+                // Не сбрасываем httpReady — возможно, временная проблема.
+                DebugTimingLogger.logEvent("benchmark.http_empty_result")
+            }
+        }
+
+        // 2) ML Kit, если готов
+        if (mlkitReady.get() && mlkitTranslator.isReady()) {
+            val t0 = System.nanoTime()
+            val mlkitResult = try {
+                mlkitTranslator.translateAll(texts)
+            } catch (t: Throwable) {
+                Log.w(tag, "ML Kit failed: ${t.message}")
+                emptyList()
+            }
+            val ms = (System.nanoTime() - t0) / 1_000_000.0
+            DebugTimingLogger.logTiming("benchmark.mlkit", ms,
+                mapOf(
+                    "text_in" to (texts.firstOrNull() ?: "").take(200),
+                    "text_out" to (mlkitResult.firstOrNull()?.second ?: "").take(200),
+                    "count" to texts.size
+                ))
             DebugTimingLogger.logEvent("benchmark.done",
-                mapOf("engines" to "http", "fallback" to false))
-            return httpResult
+                mapOf("engines" to "mlkit", "fallback" to true))
+            return mlkitResult
         }
 
-        // Fallback на ML Kit
-        val t0 = System.nanoTime()
-        val mlkitResult = try {
-            mlkitTranslator.translateAll(texts)
-        } catch (t: Throwable) {
-            Log.w(tag, "ML Kit failed: ${t.message}")
-            emptyList()
-        }
-        val ms = (System.nanoTime() - t0) / 1_000_000.0
-        DebugTimingLogger.logTiming("benchmark.mlkit", ms,
-            mapOf(
-                "text_in" to (texts.firstOrNull() ?: "").take(200),
-                "text_out" to (mlkitResult.firstOrNull()?.second ?: "").take(200),
-                "count" to texts.size
-            ))
+        // Ничего не готово — пусто
         DebugTimingLogger.logEvent("benchmark.done",
-            mapOf("engines" to "mlkit", "fallback" to true))
-        return mlkitResult
+            mapOf("engines" to "none"))
+        return emptyList()
     }
 
     private suspend fun runHttp(texts: List<String>): Pair<List<Pair<String, String>>, Double> {
-        val httpAllowed = System.currentTimeMillis() >= httpDisabledUntil
-        if (!httpAllowed) {
-            DebugTimingLogger.logEvent("benchmark.http_skipped",
-                mapOf("reason" to "temporarily_disabled"))
-            return emptyList<Pair<String, String>>() to 0.0
-        }
-
         val t0 = System.nanoTime()
         val httpResult = try {
             translateHttp(texts)
@@ -110,22 +198,7 @@ class BenchmarkTranslator(
                 "text_out" to (httpResult.firstOrNull()?.second ?: "").take(200),
                 "count" to texts.size
             ))
-
-        if (httpResult.isNotEmpty()) {
-            httpFailures = 0
-            return httpResult to ms
-        }
-
-        httpFailures++
-        DebugTimingLogger.logEvent("benchmark.http_failed",
-            mapOf("failures" to httpFailures, "ms" to ms))
-        if (httpFailures >= HTTP_FAILURE_LIMIT) {
-            httpDisabledUntil = System.currentTimeMillis() + HTTP_DISABLE_MS
-            DebugTimingLogger.logEvent("benchmark.http_disabled",
-                mapOf("until_ms" to HTTP_DISABLE_MS))
-            httpFailures = 0
-        }
-        return emptyList<Pair<String, String>>() to ms
+        return httpResult to ms
     }
 
     private suspend fun translateHttp(texts: List<String>): List<Pair<String, String>> {
@@ -161,12 +234,37 @@ class BenchmarkTranslator(
         }
     }
 
+    private suspend fun pingServer(): Boolean {
+        pingAttempts++
+        return try {
+            withContext(Dispatchers.IO) {
+                val endpoint = Settings.getTranslateEndpoint(context)
+                val body = "{\"texts\":[\"ping\"],\"source\":\"auto\",\"target\":\"$targetLang\"}"
+                    .toRequestBody(jsonMedia)
+                val req = Request.Builder().url(endpoint).post(body).build()
+                httpClient.newCall(req).execute().use { resp ->
+                    val ok = resp.isSuccessful
+                    if (ok && !lastPingLoggedOk) {
+                        lastPingLoggedOk = true
+                    }
+                    ok
+                }
+            }
+        } catch (t: Throwable) {
+            false
+        }
+    }
+
     fun close() {
+        try { mlkitJob?.cancel() } catch (_: Throwable) {}
+        try { pingJob?.cancel() } catch (_: Throwable) {}
         mlkitTranslator.close()
         try {
             httpClient.dispatcher.executorService.shutdown()
             httpClient.connectionPool.evictAll()
         } catch (_: Throwable) {}
+        httpReady.set(false)
+        mlkitReady.set(false)
         ready.set(false)
     }
 }

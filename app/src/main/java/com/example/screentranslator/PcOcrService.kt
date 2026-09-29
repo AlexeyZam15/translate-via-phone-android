@@ -95,8 +95,13 @@ class PcOcrService : Service(), SharedPreferences.OnSharedPreferenceChangeListen
         }
 
         scope.launch {
-            launch { benchmarkTranslator?.prepare() }
-            withTimeoutOrNull(8000L) {
+            // prepare() сам быстро пингует PC-эндпоинт (порт 5008).
+            // ML Kit готовится в фоне, не блокируя.
+            benchmarkTranslator?.prepare()
+
+            // Ждём готовности недолго — 2 секунды.
+            // HTTP-перевод обычно готов сразу; ML Kit не ждём.
+            withTimeoutOrNull(2000L) {
                 while (benchmarkTranslator?.isReady() != true) {
                     delay(100)
                 }
@@ -418,9 +423,7 @@ class PcOcrService : Service(), SharedPreferences.OnSharedPreferenceChangeListen
 
         private const val VOWELS = "aeiouyAEIOUYаеёиоуыэюяАЕЁИОУЫЭЮЯ"
 
-        // Расширенный список частых английских биграмм.
         private val ENG_BIGRAMS: Set<String> = hashSetOf(
-            // Базовые
             "th", "he", "in", "er", "an", "re", "on", "at", "en", "nd",
             "ti", "es", "or", "te", "of", "ed", "is", "it", "al", "ar",
             "st", "to", "nt", "ng", "se", "ha", "as", "ou", "io", "le",
@@ -434,7 +437,6 @@ class PcOcrService : Service(), SharedPreferences.OnSharedPreferenceChangeListen
             "mu", "na", "ni", "nu", "ob", "oc", "op", "pa", "pi", "pu",
             "sa", "sc", "sp", "su", "sy", "va", "vi", "vo", "wa", "we",
             "wi", "wo", "ye", "yo", "za", "ze", "zo",
-            // Расширение: частые сочетания
             "sl", "ep", "py", "ap", "pp", "ys", "em", "tt", "ty", "ow",
             "bl", "cl", "fl", "gl", "br", "cr", "dr", "fr", "gr", "sw",
             "sk", "sm", "sn", "sq", "str", "scr", "spr", "spl", "thr",
@@ -448,8 +450,6 @@ class PcOcrService : Service(), SharedPreferences.OnSharedPreferenceChangeListen
             "ape", "ipe", "ope", "ale", "ile", "ole", "ule"
         )
 
-        // Английские суффиксы. Если слово оканчивается на суффикс —
-        // считаем его английским, биграммы не проверяем.
         private val ENG_SUFFIXES: List<String> = listOf(
             "ing", "ed", "ly", "er", "est", "tion", "sion", "ous", "ful",
             "less", "able", "ible", "ment", "ness", "ity", "ty", "al",
@@ -457,27 +457,6 @@ class PcOcrService : Service(), SharedPreferences.OnSharedPreferenceChangeListen
             "ate", "y", "ies", "ied", "ier", "iest", "able", "ible"
         )
 
-        /**
-         * Быстрый фильтр мусора OCR.
-         *
-         * Отсеивает:
-         *   • длину < 3;
-         *   • строки без букв;
-         *   • наши логи ([HH:MM:SS] OCR/TR);
-         *   • URL;
-         *   • > 40% не-буквенно-цифровых;
-         *   • смесь латиницы и кириллицы (латиницы > 30%);
-         *   • цифру между буквами;
-         *   • > 50% заглавных при длине >= 5;
-         *   • нет гласных в первых 20 символах;
-         *   • заглавную кириллицу после строчной кириллицы;
-         *   • латинское слово длиной >= 5 с < 3 английскими биграммами
-         *     (если слово НЕ оканчивается на английский суффикс);
-         *   • латинское слово длиной >= 6 с 2+ заглавными не в первой позиции;
-         *   • слово длиной >= 4 с цифрой внутри.
-         *
-         * Работает быстро: ранние выходы, один проход по строке.
-         */
         fun isMeaningfulText(raw: String): Boolean {
             val t = raw.trim()
             val n = t.length
@@ -549,7 +528,6 @@ class PcOcrService : Service(), SharedPreferences.OnSharedPreferenceChangeListen
 
             if (n >= 5 && letters > 0 && upper * 100 / letters > 50) return false
 
-            // Правило 11: заглавная кириллица после строчной кириллицы
             for (i in 1 until n) {
                 val c = t[i]
                 val p = t[i - 1]
@@ -558,10 +536,6 @@ class PcOcrService : Service(), SharedPreferences.OnSharedPreferenceChangeListen
                 }
             }
 
-            // Правило 12: для каждого латинского слова длиной >= 5 —
-            // проверяем суффикс (если есть — ок), иначе минимум 3 биграммы
-            // и не более 1 заглавной не в первой позиции.
-            // Правило 13: слово длиной >= 4 с цифрой внутри — отсеивать.
             var wordStart = -1
             var wordIsLatin = false
             var wordHasDigit = false
@@ -587,14 +561,11 @@ class PcOcrService : Service(), SharedPreferences.OnSharedPreferenceChangeListen
                 } else {
                     if (wordStart != -1) {
                         val wordLen = i - wordStart
-                        // Правило 13: цифра внутри слова длиной >= 4
                         if (wordHasDigit && wordLen >= 4) {
                             return false
                         }
-                        // Правило 12: латинское слово длиной >= 5
                         if (wordIsLatin && !wordHasDigit && wordLen >= 5) {
                             val word = t.substring(wordStart, i).lowercase()
-                            // Проверка суффикса
                             var hasSuffix = false
                             for (suf in ENG_SUFFIXES) {
                                 if (word.endsWith(suf) && word.length > suf.length) {
@@ -603,7 +574,6 @@ class PcOcrService : Service(), SharedPreferences.OnSharedPreferenceChangeListen
                                 }
                             }
                             if (!hasSuffix) {
-                                // Проверка биграмм
                                 var bigrams = 0
                                 var upperMid = 0
                                 var j = wordStart
@@ -634,7 +604,6 @@ class PcOcrService : Service(), SharedPreferences.OnSharedPreferenceChangeListen
                 }
             }
 
-            // Нет гласных в первых 20 символах
             val checkLen = if (n < 20) n else 20
             var hasVowel = false
             for (i in 0 until checkLen) {
