@@ -23,12 +23,14 @@ import java.util.concurrent.atomic.AtomicBoolean
  * Переводчик: HTTP (CTranslate2 на ПК) + ML Kit (fallback).
  *
  * ИЗМЕНЕНО:
- *   - HTTP и ML Kit теперь независимы. isReady() = httpReady || mlkitReady.
- *   - prepare() сначала быстро пингует PC-эндпоинт (порт 5008).
- *     Если PC ответил — ready=true немедленно, ML Kit готовится в фоне.
- *   - Если ни HTTP, ни ML Kit не готовы — раз в 3 секунды перепинг PC.
- *   - HTTP-перевод больше не «отключается» при фейлах, просто пробуется снова.
- *   - Логи: benchmark.http_ping_ok / fail, benchmark.mlkit_ready, benchmark.is_ready.
+ *   - УБРАН второй проход ML Kit (mlkit_retry). Он дублировал работу
+ *     и тратил время. Retry теперь реализован внутри OcrTranslator
+ *     через failedCache с TTL.
+ *   - HTTP watchdog работает, пока !httpReady, независимо от ready.
+ *   - Возвращаются ТОЛЬКО переведённые пары.
+ *   - ФИЛЬТР: пары, где перевод совпадает с оригиналом
+ *     (Wii → Wii, Nintendo → Nintendo, EMBLEM → EMBLEM),
+ *     НЕ добавляются в результат.
  */
 class BenchmarkTranslator(
     private val context: Context,
@@ -49,22 +51,18 @@ class BenchmarkTranslator(
         .build()
     private val jsonMedia = "application/json; charset=utf-8".toMediaType()
 
-    // Флаги готовности движков
     private val httpReady = AtomicBoolean(false)
     private val mlkitReady = AtomicBoolean(false)
     private val ready = AtomicBoolean(false)
 
-    // Фоновый скоуп для ML Kit-подготовки и периодического перепинга
     private val bgScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private var mlkitJob: Job? = null
     private var pingJob: Job? = null
 
-    // Антифлуд логов
     @Volatile private var lastPingLoggedOk = false
     @Volatile private var pingAttempts = 0
 
     suspend fun prepare() {
-        // 1) Быстрый пинг PC-эндпоинта (порт 5008)
         val httpOk = pingServer()
         if (httpOk) {
             httpReady.set(true)
@@ -78,7 +76,6 @@ class BenchmarkTranslator(
             Log.w(tag, "HTTP translator not available at start")
         }
 
-        // 2) ML Kit готовим в фоне, не блокируя ready
         mlkitJob?.cancel()
         mlkitJob = bgScope.launch {
             try {
@@ -99,7 +96,6 @@ class BenchmarkTranslator(
             }
         }
 
-        // 3) Если HTTP не готов — запускаем периодический перепинг
         if (!httpOk) {
             startHttpWatchdog()
         }
@@ -113,13 +109,12 @@ class BenchmarkTranslator(
     private fun startHttpWatchdog() {
         pingJob?.cancel()
         pingJob = bgScope.launch {
-            while (!httpReady.get() && ready.get().not()) {
+            while (!httpReady.get()) {
                 delay(3000L)
                 if (httpReady.get()) break
                 val ok = pingServer()
                 if (ok) {
                     httpReady.set(true)
-                    ready.set(true)
                     DebugTimingLogger.logEvent("benchmark.http_ping_late_ok",
                         mapOf("attempts" to pingAttempts))
                     Log.d(tag, "HTTP translator became READY (late)")
@@ -132,73 +127,82 @@ class BenchmarkTranslator(
         }
     }
 
-    fun isReady(): Boolean = ready.get() && (httpReady.get() || mlkitReady.get())
+    fun isReady(): Boolean = httpReady.get() || mlkitReady.get()
 
+    fun isHttpReady(): Boolean = httpReady.get()
+
+    /**
+     * Мерджит результаты HTTP и ML Kit.
+     *
+     *   1) HTTP переводит всё, что может.
+     *   2) ML Kit переводит оставшиеся блоки.
+     *   3) Результаты мерджатся в LinkedHashMap (сохраняя порядок).
+     *
+     * Возвращаются ТОЛЬКО переведённые пары.
+     * Повторные попытки для непереведённых блоков реализованы
+     * внутри OcrTranslator через failedCache (TTL 3 сек).
+     */
     suspend fun translateAll(texts: List<String>): List<Pair<String, String>> {
-        if (!ready.get() || texts.isEmpty()) return emptyList()
+        if (texts.isEmpty()) return emptyList()
+        if (!ready.get() && !httpReady.get()) return emptyList()
 
         DebugTimingLogger.logEvent("benchmark.start",
             mapOf("count" to texts.size, "target" to targetLang,
                 "http" to httpReady.get(), "mlkit" to mlkitReady.get()))
 
-        // 1) HTTP первым, если готов
+        val merged = LinkedHashMap<String, String>()
+
+        // 1) HTTP — если готов.
         if (httpReady.get()) {
-            val (httpResult, _) = runHttp(texts)
-            if (httpResult.isNotEmpty()) {
-                DebugTimingLogger.logEvent("benchmark.done",
-                    mapOf("engines" to "http", "fallback" to false))
-                return httpResult
-            } else {
-                // HTTP был готов, но конкретный запрос провалился.
-                // Не сбрасываем httpReady — возможно, временная проблема.
-                DebugTimingLogger.logEvent("benchmark.http_empty_result")
+            try {
+                val t0 = System.nanoTime()
+                val httpResult = translateHttp(texts)
+                val ms = (System.nanoTime() - t0) / 1_000_000.0
+                DebugTimingLogger.logTiming("benchmark.http", ms,
+                    mapOf("count" to texts.size))
+                for ((src, dst) in httpResult) {
+                    if (!merged.containsKey(src)) {
+                        merged[src] = dst
+                    }
+                }
+            } catch (t: Throwable) {
+                Log.w(tag, "HTTP failed: ${t.message}")
+                DebugTimingLogger.logEvent("benchmark.http_error",
+                    mapOf("error" to (t.message ?: "")))
             }
         }
 
-        // 2) ML Kit, если готов
-        if (mlkitReady.get() && mlkitTranslator.isReady()) {
-            val t0 = System.nanoTime()
-            val mlkitResult = try {
-                mlkitTranslator.translateAll(texts)
+        // 2) ML Kit — для оставшихся блоков.
+        // ИЗМЕНЕНО: без второго прохода (mlkit_retry).
+        // Retry реализован внутри OcrTranslator через failedCache.
+        val remaining = texts.filter { !merged.containsKey(it) }
+        if (remaining.isNotEmpty() && mlkitReady.get() && mlkitTranslator.isReady()) {
+            try {
+                val t0 = System.nanoTime()
+                val mlkitResult = mlkitTranslator.translateAll(remaining)
+                val ms = (System.nanoTime() - t0) / 1_000_000.0
+                DebugTimingLogger.logTiming("benchmark.mlkit", ms,
+                    mapOf("count" to remaining.size))
+                for ((src, dst) in mlkitResult) {
+                    if (!merged.containsKey(src)) {
+                        merged[src] = dst
+                    }
+                }
             } catch (t: Throwable) {
                 Log.w(tag, "ML Kit failed: ${t.message}")
-                emptyList()
+                DebugTimingLogger.logEvent("benchmark.mlkit_error",
+                    mapOf("error" to (t.message ?: "")))
             }
-            val ms = (System.nanoTime() - t0) / 1_000_000.0
-            DebugTimingLogger.logTiming("benchmark.mlkit", ms,
-                mapOf(
-                    "text_in" to (texts.firstOrNull() ?: "").take(200),
-                    "text_out" to (mlkitResult.firstOrNull()?.second ?: "").take(200),
-                    "count" to texts.size
-                ))
-            DebugTimingLogger.logEvent("benchmark.done",
-                mapOf("engines" to "mlkit", "fallback" to true))
-            return mlkitResult
         }
 
-        // Ничего не готово — пусто
+        val result = merged.entries.map { it.key to it.value }
         DebugTimingLogger.logEvent("benchmark.done",
-            mapOf("engines" to "none"))
-        return emptyList()
-    }
-
-    private suspend fun runHttp(texts: List<String>): Pair<List<Pair<String, String>>, Double> {
-        val t0 = System.nanoTime()
-        val httpResult = try {
-            translateHttp(texts)
-        } catch (t: Throwable) {
-            Log.w(tag, "HTTP failed: ${t.message}")
-            emptyList()
-        }
-        val ms = (System.nanoTime() - t0) / 1_000_000.0
-
-        DebugTimingLogger.logTiming("benchmark.http", ms,
             mapOf(
-                "text_in" to (texts.firstOrNull() ?: "").take(200),
-                "text_out" to (httpResult.firstOrNull()?.second ?: "").take(200),
-                "count" to texts.size
+                "engines" to (if (httpReady.get()) "http+mlkit" else "mlkit"),
+                "translated" to result.size,
+                "total" to texts.size
             ))
-        return httpResult to ms
+        return result
     }
 
     private suspend fun translateHttp(texts: List<String>): List<Pair<String, String>> {
@@ -225,13 +229,17 @@ class BenchmarkTranslator(
                 val out = ArrayList<Pair<String, String>>()
                 for (i in 0 until minOf(transArr.length(), texts.size)) {
                     val tr = transArr.optString(i, "")
-                    if (tr.isNotBlank()) {
+                    if (tr.isNotBlank() && !isSameText(texts[i], tr)) {
                         out.add(texts[i] to tr)
                     }
                 }
                 out
             }
         }
+    }
+
+    private fun isSameText(original: String, translated: String): Boolean {
+        return original.trim().lowercase() == translated.trim().lowercase()
     }
 
     private suspend fun pingServer(): Boolean {

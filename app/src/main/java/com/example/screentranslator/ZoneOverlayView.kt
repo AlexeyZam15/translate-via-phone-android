@@ -9,6 +9,8 @@ import android.text.Layout
 import android.text.StaticLayout
 import android.text.TextPaint
 import android.view.View
+import kotlin.math.max
+import kotlin.math.min
 
 class ZoneOverlayView(context: Context) : View(context) {
 
@@ -19,6 +21,13 @@ class ZoneOverlayView(context: Context) : View(context) {
     private var showConfidence: Boolean = false
     private var showTranslation: Boolean = false
     private var bgAlpha: Int = 217
+
+    /**
+     * ИЗМЕНЕНО: отступ OCR в процентах (0..50).
+     * Используется в debug-режиме для отрисовки зелёной рамки —
+     * расширенного bbox, куда попадёт crop при refine.
+     */
+    private var ocrPadding: Int = 0
 
     private val boxPaint = Paint().apply {
         color = Color.RED
@@ -71,7 +80,8 @@ class ZoneOverlayView(context: Context) : View(context) {
         sourceH: Int,
         showConfidence: Boolean = false,
         showTranslation: Boolean = false,
-        bgAlpha: Int = 217
+        bgAlpha: Int = 217,
+        ocrPadding: Int = 0
     ) {
         blocks = newBlocks
         sourceWidth = sourceW
@@ -79,6 +89,7 @@ class ZoneOverlayView(context: Context) : View(context) {
         this.showConfidence = showConfidence
         this.showTranslation = showTranslation
         this.bgAlpha = bgAlpha.coerceIn(0, 255)
+        this.ocrPadding = ocrPadding.coerceIn(0, 50)
         invalidate()
     }
 
@@ -104,7 +115,8 @@ class ZoneOverlayView(context: Context) : View(context) {
                 if (showTranslation) {
                     drawTranslation(canvas, block, left, top, right, bottom)
                 } else if (showConfidence) {
-                    drawDebugZone(canvas, block, left, top, right, bottom, scaleX, scaleY)
+                    drawDebugZone(canvas, block, left, top, right, bottom,
+                        scaleX, scaleY)
                 }
             }
         } finally {
@@ -172,21 +184,35 @@ class ZoneOverlayView(context: Context) : View(context) {
         }
     }
 
+    /**
+     * ИЗМЕНЕНО: в debug-режиме рисуем ДВЕ рамки:
+     *   - красная — оригинальный bbox (boundingBox).
+     *   - зелёная — bbox, расширенный на ocrPadding.
+     *
+     * Раньше зелёная рисовалась по initialBoundingBox (то, что было
+     * до refine), что не соответствовало текущей настройке
+     * "Отступ OCR". Теперь зелёная наглядно показывает, куда попадёт
+     * crop при refine с текущим padding.
+     */
     private fun drawDebugZone(
         canvas: Canvas,
         block: OcrBlock,
         left: Float, top: Float, right: Float, bottom: Float,
         scaleX: Float, scaleY: Float
     ) {
-        val ir = block.initialBoundingBox
-        if (ir.width() > 0 && ir.height() > 0) {
-            val iLeft = ir.left * scaleX
-            val iTop = ir.top * scaleY
-            val iRight = ir.right * scaleX
-            val iBottom = ir.bottom * scaleY
-            canvas.drawRect(iLeft, iTop, iRight, iBottom, initialBoxPaint)
-        }
+        // Зелёная рамка — bbox + padding.
+        val pad = ocrPadding / 100f
+        val r: Rect = block.boundingBox
+        val padX = (r.width() * pad).toInt()
+        val padY = (r.height() * pad).toInt()
+        val paddedLeft = (r.left - padX) * scaleX
+        val paddedTop = (r.top - padY) * scaleY
+        val paddedRight = (r.right + padX) * scaleX
+        val paddedBottom = (r.bottom + padY) * scaleY
+        canvas.drawRect(paddedLeft, paddedTop, paddedRight, paddedBottom,
+            initialBoxPaint)
 
+        // Красная рамка — оригинальный bbox.
         canvas.drawRect(left, top, right, bottom, boxPaint)
 
         val label = block.text.take(30)

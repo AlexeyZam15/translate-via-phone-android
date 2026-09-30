@@ -8,6 +8,7 @@ import android.content.Intent
 import android.content.SharedPreferences
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.Rect
 import android.os.Build
 import android.os.IBinder
 import android.util.Log
@@ -23,9 +24,13 @@ import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import org.json.JSONObject
+import java.security.MessageDigest
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
+import kotlin.math.abs
+import kotlin.math.hypot
 
 class PcOcrService : Service(), SharedPreferences.OnSharedPreferenceChangeListener {
 
@@ -44,6 +49,25 @@ class PcOcrService : Service(), SharedPreferences.OnSharedPreferenceChangeListen
         val mode: String,
         val overlayAlpha: Int,
         val isEmpty: Boolean
+    )
+
+    private data class StableBlock(
+        var text: String,
+        var x: Int,
+        var y: Int,
+        var w: Int,
+        var h: Int,
+        var lastSeenFrame: Long,
+        var pendingText: String?,
+        var pendingCount: Int,
+        var refined: Boolean,
+        var refineCounter: Int
+    )
+
+    private data class RefinedResult(
+        val text: String,
+        val box: Rect,
+        val geomValid: Boolean
     )
 
     private val translationQueue = Channel<OcrJob>(capacity = 2)
@@ -65,6 +89,14 @@ class PcOcrService : Service(), SharedPreferences.OnSharedPreferenceChangeListen
     @Volatile private var lastMode: String = ""
 
     private val droppedCount = AtomicInteger(0)
+
+    private val stableBlocks = mutableListOf<StableBlock>()
+    private var frameCounter: Long = 0L
+
+    @Volatile private var lastFrameHash: Long = 0L
+    @Volatile private var stableFrameStreak: Int = 0
+
+    private val translationCache = ConcurrentHashMap<String, String>()
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val engineName = intent?.getStringExtra(EXTRA_ENGINE) ?: OcrType.ML_KIT.name
@@ -95,12 +127,8 @@ class PcOcrService : Service(), SharedPreferences.OnSharedPreferenceChangeListen
         }
 
         scope.launch {
-            // prepare() сам быстро пингует PC-эндпоинт (порт 5008).
-            // ML Kit готовится в фоне, не блокируя.
             benchmarkTranslator?.prepare()
 
-            // Ждём готовности недолго — 2 секунды.
-            // HTTP-перевод обычно готов сразу; ML Kit не ждём.
             withTimeoutOrNull(2000L) {
                 while (benchmarkTranslator?.isReady() != true) {
                     delay(100)
@@ -168,6 +196,7 @@ class PcOcrService : Service(), SharedPreferences.OnSharedPreferenceChangeListen
                 benchmarkTranslator = BenchmarkTranslator(
                     this@PcOcrService, targetLang, sourceLang)
                 benchmarkTranslator?.prepare()
+                translationCache.clear()
             }
         } catch (_: Exception) {
             DebugTimingLogger.logEvent("android.settings_load_from_pc_failed")
@@ -204,13 +233,641 @@ class PcOcrService : Service(), SharedPreferences.OnSharedPreferenceChangeListen
 
     override fun onSharedPreferenceChanged(prefs: SharedPreferences?, key: String?) {
         loadSettings()
+        if (key == Settings.KEY_DEBUG) {
+            stableBlocks.clear()
+            queuedHash = 0
+            queuedMode = ""
+            lastFrameHash = 0L
+            stableFrameStreak = 0
+        }
         if (key == Settings.KEY_SOURCE_LANG || key == Settings.KEY_TARGET_LANG) {
             scope.launch {
                 benchmarkTranslator?.close()
                 benchmarkTranslator = BenchmarkTranslator(
                     this@PcOcrService, targetLang, sourceLang)
                 benchmarkTranslator?.prepare()
+                translationCache.clear()
             }
+        }
+        if (key == Settings.KEY_OCR_PADDING) {
+            for (sb in stableBlocks) {
+                sb.refined = false
+                sb.refineCounter = 0
+            }
+        }
+    }
+
+    private fun deduplicateOverlapping(blocks: List<OcrBlock>): List<OcrBlock> {
+        if (blocks.size <= 1) return blocks
+
+        val sorted = blocks.sortedByDescending { b ->
+            val r = b.boundingBox
+            b.confidence.toDouble() * (r.width().toDouble() * r.height().toDouble())
+        }
+
+        val accepted = ArrayList<OcrBlock>(sorted.size)
+        for (b in sorted) {
+            if (!overlapsAnyBlock(b, accepted)) {
+                accepted.add(b)
+            }
+        }
+        return accepted
+    }
+
+    private fun overlapsAnyBlock(b: OcrBlock, already: List<OcrBlock>): Boolean {
+        val r = b.boundingBox
+        val areaB = r.width().toLong() * r.height().toLong()
+        if (areaB <= 0) return false
+
+        for (other in already) {
+            val o = other.boundingBox
+            val areaO = o.width().toLong() * o.height().toLong()
+            if (areaO <= 0) continue
+
+            val ix1 = maxOf(r.left, o.left)
+            val iy1 = maxOf(r.top, o.top)
+            val ix2 = minOf(r.right, o.right)
+            val iy2 = minOf(r.bottom, o.bottom)
+            val iw = ix2 - ix1
+            val ih = iy2 - iy1
+            if (iw <= 0 || ih <= 0) continue
+
+            val inter = iw.toLong() * ih.toLong()
+            val minArea = minOf(areaB, areaO)
+            if (minArea <= 0) continue
+
+            val ratio = inter.toDouble() / minArea.toDouble()
+            if (ratio >= DEDUP_OVERLAP_RATIO) {
+                return true
+            }
+        }
+        return false
+    }
+
+    private fun normalizeText(raw: String): String {
+        var t = raw.trim()
+        if (t.isEmpty()) return t
+
+        val leadMatch = NORMALIZE_LEAD_REGEX.find(t)
+        if (leadMatch != null) {
+            val prefix = leadMatch.groupValues[1]
+            val rest = leadMatch.groupValues[2]
+            if (prefix !in NORMALIZE_SKIP_WORDS) {
+                t = rest
+            }
+        }
+
+        t = stripTrailingVowel(t)
+
+        val trailMatch = NORMALIZE_TRAIL_REGEX.find(t)
+        if (trailMatch != null) {
+            t = trailMatch.groupValues[1]
+        }
+
+        return t.trim()
+    }
+
+    private fun stripTrailingVowel(text: String): String {
+        if (text.length < 2) return text
+
+        val words = text.split(' ', '\t', '\n')
+        val lastWord = words.lastOrNull() ?: return text
+        if (lastWord.length < 3) return text
+
+        val last = lastWord.last()
+        val lastLower = last.lowercaseChar()
+        if (lastLower !in TRAILING_VOWELS) return text
+
+        val beforeLast = lastWord[lastWord.length - 2]
+        val beforeLower = beforeLast.lowercaseChar()
+        if (beforeLower !in CONSONANTS) return text
+
+        val lastWordLower = lastWord.lowercase()
+        if (lastWordLower in NORMALIZE_WHITELIST) return text
+        if (hasNaturalSuffix(lastWordLower)) return text
+
+        val trimmedWord = lastWord.dropLast(1)
+        if (trimmedWord.isEmpty()) return text
+        if (trimmedWord.length < 2) return text
+
+        val prefix = text.substring(0, text.length - lastWord.length)
+        return prefix + trimmedWord
+    }
+
+    private fun hasNaturalSuffix(word: String): Boolean {
+        for (suf in ENG_SUFFIXES) {
+            if (word.endsWith(suf) && word.length > suf.length) {
+                return true
+            }
+        }
+        return false
+    }
+
+    private fun isPercentBlock(text: String): Boolean {
+        return text.contains('%')
+    }
+
+    private fun isContained(
+        smallX: Int, smallY: Int, smallW: Int, smallH: Int,
+        bigX: Int, bigY: Int, bigW: Int, bigH: Int,
+        margin: Double
+    ): Boolean {
+        if (smallW <= 0 || smallH <= 0 || bigW <= 0 || bigH <= 0) return false
+
+        val marginX = (bigW * margin).toInt()
+        val marginY = (bigH * margin).toInt()
+
+        val bigLeft = bigX - marginX
+        val bigTop = bigY - marginY
+        val bigRight = bigX + bigW + marginX
+        val bigBottom = bigY + bigH + marginY
+
+        val smallLeft = smallX
+        val smallTop = smallY
+        val smallRight = smallX + smallW
+        val smallBottom = smallY + smallH
+
+        return smallLeft >= bigLeft &&
+                smallTop >= bigTop &&
+                smallRight <= bigRight &&
+                smallBottom <= bigBottom
+    }
+
+    private fun overlapsAnyStable(
+        nb: OcrBlock,
+        used: BooleanArray
+    ): Boolean {
+        val r = nb.boundingBox
+        if (r.width() <= 0 || r.height() <= 0) return false
+
+        for ((idx, sb) in stableBlocks.withIndex()) {
+            val iou = computeIoU(
+                sb.x, sb.y, sb.w, sb.h,
+                r.left, r.top, r.width(), r.height()
+            )
+            if (iou > 0.0) return true
+
+            if (isContained(
+                    sb.x, sb.y, sb.w, sb.h,
+                    r.left, r.top, r.width(), r.height(),
+                    CONTAINMENT_MARGIN
+                )) return true
+            if (isContained(
+                    r.left, r.top, r.width(), r.height(),
+                    sb.x, sb.y, sb.w, sb.h,
+                    CONTAINMENT_MARGIN
+                )) return true
+        }
+        return false
+    }
+
+    private fun textsAreSimilar(a: String, b: String): Boolean {
+        if (a.isEmpty() || b.isEmpty()) return false
+        val la = a.trim().lowercase()
+        val lb = b.trim().lowercase()
+        if (la == lb) return true
+        if (la.startsWith(lb) || lb.startsWith(la)) return true
+
+        val shorter = if (la.length <= lb.length) la else lb
+        val longer = if (la.length <= lb.length) lb else la
+
+        var common = 0
+        for (c in shorter) {
+            if (c.isLetterOrDigit() && longer.contains(c)) {
+                common++
+            }
+        }
+        val lettersInShort = shorter.count { it.isLetterOrDigit() }
+        if (lettersInShort == 0) return false
+        val ratio = common.toDouble() / lettersInShort.toDouble()
+        return ratio >= 0.6
+    }
+
+    private fun stabilizeBlocks(
+        blocks: List<OcrBlock>,
+        sceneChanged: Boolean
+    ): List<OcrBlock> {
+        if (blocks.isEmpty()) {
+            pruneStableBlocks()
+            return emptyList()
+        }
+
+        frameCounter++
+
+        val used = BooleanArray(blocks.size) { false }
+        val result = ArrayList<OcrBlock>(blocks.size)
+        var matchedStableCount = 0
+
+        for (sb in stableBlocks) {
+            var bestIdx = -1
+            var bestScore = 0.0
+            for (i in blocks.indices) {
+                if (used[i]) continue
+                val nb = blocks[i]
+                val r = nb.boundingBox
+                if (r.width() <= 0 || r.height() <= 0) continue
+
+                val iou = computeIoU(
+                    sb.x, sb.y, sb.w, sb.h,
+                    r.left, r.top, r.width(), r.height()
+                )
+                val dist = centerDistance(
+                    sb.x, sb.y, sb.w, sb.h,
+                    r.left, r.top, r.width(), r.height()
+                )
+
+                val matchByIou = iou >= STABLE_IOU_THRESHOLD
+                val matchByCenter = dist < CENTER_MATCH_DIST
+                val matchByContain =
+                    isContained(
+                        sb.x, sb.y, sb.w, sb.h,
+                        r.left, r.top, r.width(), r.height(),
+                        CONTAINMENT_MARGIN
+                    ) ||
+                            isContained(
+                                r.left, r.top, r.width(), r.height(),
+                                sb.x, sb.y, sb.w, sb.h,
+                                CONTAINMENT_MARGIN
+                            )
+
+                val geometryMatch = matchByIou || matchByCenter || matchByContain
+                if (!geometryMatch) continue
+
+                val candidateText = normalizeText(nb.text)
+                if (!textsAreSimilar(sb.text, candidateText)) continue
+
+                var score = iou
+                if (matchByCenter) {
+                    score += (1.0 - dist / CENTER_MATCH_DIST) * 0.5
+                }
+                if (matchByContain) {
+                    score += 0.2
+                }
+                if (score > bestScore) {
+                    bestScore = score
+                    bestIdx = i
+                }
+            }
+
+            if (bestIdx < 0) {
+                continue
+            }
+
+            used[bestIdx] = true
+            matchedStableCount++
+            val nb = blocks[bestIdx]
+            val newText = normalizeText(nb.text)
+            if (newText.isEmpty()) {
+                sb.lastSeenFrame = frameCounter
+                continue
+            }
+
+            // ИЗМЕНЕНО: точное сравнение текста, БЕЗ textsAreSimilar.
+            // Если текст реально изменился (даже на 1 символ) —
+            // pendingCount начинает накапливаться и через
+            // STABLE_TEXT_UPDATE_THRESHOLD кадров sb.text обновится.
+            // Раньше textsAreSimilar возвращал true для похожих текстов,
+            // pendingCount сбрасывался, и старый текст оставался навсегда.
+            if (newText == sb.text) {
+                sb.pendingText = null
+                sb.pendingCount = 0
+            } else if (newText == sb.pendingText) {
+                sb.pendingCount++
+                if (sb.pendingCount >= STABLE_TEXT_UPDATE_THRESHOLD) {
+                    sb.text = newText
+                    sb.pendingText = null
+                    sb.pendingCount = 0
+                }
+            } else {
+                sb.pendingText = newText
+                sb.pendingCount = 1
+            }
+
+            sb.lastSeenFrame = frameCounter
+            sb.refineCounter++
+
+            // Обновляем геометрию при сдвиге на 3+ пикселя
+            // и изменении размера на 5+ пикселей.
+            val nbR = nb.boundingBox
+            if (abs(nbR.left - sb.x) >= POS_CHANGE_THRESHOLD) sb.x = nbR.left
+            if (abs(nbR.top - sb.y) >= POS_CHANGE_THRESHOLD) sb.y = nbR.top
+            if (abs(nbR.width() - sb.w) >= SIZE_CHANGE_THRESHOLD) sb.w = nbR.width()
+            if (abs(nbR.height() - sb.h) >= SIZE_CHANGE_THRESHOLD) sb.h = nbR.height()
+
+            result.add(
+                OcrBlock(
+                    text = sb.text,
+                    boundingBox = Rect(sb.x, sb.y, sb.x + sb.w, sb.y + sb.h),
+                    confidence = nb.confidence,
+                    initialBoundingBox = Rect(sb.x, sb.y, sb.x + sb.w, sb.y + sb.h)
+                )
+            )
+        }
+
+        if (sceneChanged && matchedStableCount == 0 && stableBlocks.isNotEmpty()) {
+            Log.d(TAG, "scene changed: no stable matched, clear stableBlocks")
+            DebugTimingLogger.logEvent("android.pc_ocr_scene_changed",
+                mapOf("new_blocks" to blocks.size))
+            stableBlocks.clear()
+        }
+
+        for (i in blocks.indices) {
+            if (used[i]) continue
+            val nb = blocks[i]
+            val r = nb.boundingBox
+            if (r.width() <= 0 || r.height() <= 0) continue
+
+            val newText = normalizeText(nb.text)
+            if (newText.isEmpty()) continue
+
+            if (overlapsAnyStable(nb, used)) {
+                continue
+            }
+
+            val sb = StableBlock(
+                text = newText,
+                x = r.left,
+                y = r.top,
+                w = r.width(),
+                h = r.height(),
+                lastSeenFrame = frameCounter,
+                pendingText = null,
+                pendingCount = 0,
+                refined = false,
+                refineCounter = 0
+            )
+            stableBlocks.add(sb)
+
+            result.add(
+                OcrBlock(
+                    text = sb.text,
+                    boundingBox = Rect(sb.x, sb.y, sb.x + sb.w, sb.y + sb.h),
+                    confidence = nb.confidence,
+                    initialBoundingBox = Rect(sb.x, sb.y, sb.x + sb.w, sb.y + sb.h)
+                )
+            )
+        }
+
+        pruneStableBlocks()
+        return result
+    }
+
+    private fun pruneStableBlocks() {
+        val threshold = frameCounter - STABLE_MISS_LIMIT
+        val it = stableBlocks.iterator()
+        while (it.hasNext()) {
+            val sb = it.next()
+            if (sb.lastSeenFrame < threshold) {
+                it.remove()
+            }
+        }
+    }
+
+    private fun computeIoU(
+        ax: Int, ay: Int, aw: Int, ah: Int,
+        bx: Int, by: Int, bw: Int, bh: Int
+    ): Double {
+        val ax2 = ax + aw
+        val ay2 = ay + ah
+        val bx2 = bx + bw
+        val by2 = by + bh
+
+        val ix1 = maxOf(ax, bx)
+        val iy1 = maxOf(ay, by)
+        val ix2 = minOf(ax2, bx2)
+        val iy2 = minOf(ay2, by2)
+
+        val iw = ix2 - ix1
+        val ih = iy2 - iy1
+        if (iw <= 0 || ih <= 0) return 0.0
+
+        val inter = iw.toDouble() * ih.toDouble()
+        val areaA = aw.toDouble() * ah.toDouble()
+        val areaB = bw.toDouble() * bh.toDouble()
+        val union = areaA + areaB - inter
+        if (union <= 0) return 0.0
+        return inter / union
+    }
+
+    private fun centerDistance(
+        ax: Int, ay: Int, aw: Int, ah: Int,
+        bx: Int, by: Int, bw: Int, bh: Int
+    ): Double {
+        val acx = ax + aw / 2.0
+        val acy = ay + ah / 2.0
+        val bcx = bx + bw / 2.0
+        val bcy = by + bh / 2.0
+        return hypot(acx - bcx, acy - bcy)
+    }
+
+    private suspend fun refineBlockText(
+        bitmapCopy: Bitmap,
+        sb: StableBlock
+    ): RefinedResult? {
+        try {
+            val rawPadding = Settings.getOcrPadding(this).coerceIn(0, 50)
+            val paddingPercent = minOf(rawPadding, REFINE_PADDING_MAX) / 100f
+            val padX = (sb.w * paddingPercent).toInt()
+            val padY = (sb.h * paddingPercent).toInt()
+
+            val cropLeft = (sb.x - padX).coerceIn(0, bitmapCopy.width - 1)
+            val cropTop = (sb.y - padY).coerceIn(0, bitmapCopy.height - 1)
+            val cropRight = (sb.x + sb.w + padX).coerceIn(cropLeft + 1, bitmapCopy.width)
+            val cropBottom = (sb.y + sb.h + padY).coerceIn(cropTop + 1, bitmapCopy.height)
+
+            val w = cropRight - cropLeft
+            val h = cropBottom - cropTop
+            if (w <= 0 || h <= 0) return null
+
+            val cropped = Bitmap.createBitmap(bitmapCopy, cropLeft, cropTop, w, h)
+            val scale = if (REFINE_SCALE > 1) REFINE_SCALE else 1
+            val processed = if (scale > 1) {
+                Bitmap.createScaledBitmap(
+                    cropped,
+                    w * scale,
+                    h * scale,
+                    true
+                )
+            } else {
+                cropped
+            }
+
+            val engine = ocrEngine ?: return null
+            val result = try {
+                engine.recognize(processed)
+            } catch (_: Exception) {
+                null
+            } finally {
+                if (processed !== cropped) {
+                    try { processed.recycle() } catch (_: Throwable) {}
+                }
+                try { cropped.recycle() } catch (_: Throwable) {}
+            }
+
+            if (result == null || result.blocks.isEmpty()) return null
+
+            var bestText: String? = null
+            var bestBox: Rect? = null
+            for (b in result.blocks) {
+                val t = normalizeText(b.text)
+                if (t.isEmpty()) continue
+                if (!isMeaningfulText(t)) continue
+                if (isPercentBlock(t)) continue
+                if (bestText == null || t.length > bestText!!.length) {
+                    bestText = t
+                    bestBox = Rect(b.boundingBox)
+                }
+            }
+
+            val refinedText = bestText ?: return null
+            val refinedBox = bestBox ?: return null
+
+            if (refinedText == sb.text && refinedText.length < sb.text.length) {
+                return null
+            }
+
+            val scaledLeft = refinedBox.left / scale
+            val scaledTop = refinedBox.top / scale
+            val scaledRight = refinedBox.right / scale
+            val scaledBottom = refinedBox.bottom / scale
+
+            val origLeft = (cropLeft + scaledLeft).coerceIn(0, bitmapCopy.width)
+            val origTop = (cropTop + scaledTop).coerceIn(0, bitmapCopy.height)
+            val origRight = (cropLeft + scaledRight).coerceIn(origLeft + 1, bitmapCopy.width)
+            val origBottom = (cropTop + scaledBottom).coerceIn(origTop + 1, bitmapCopy.height)
+
+            val newBox = Rect(origLeft, origTop, origRight, origBottom)
+
+            val dx = abs(newBox.left - sb.x)
+            val dy = abs(newBox.top - sb.y)
+            val dw = abs(newBox.width() - sb.w)
+            val dh = abs(newBox.height() - sb.h)
+
+            val maxDx = (sb.w * MAX_GEOM_DELTA_RATIO).toInt().coerceAtLeast(8)
+            val maxDy = (sb.h * MAX_GEOM_DELTA_RATIO).toInt().coerceAtLeast(8)
+            val maxDw = (sb.w * MAX_GEOM_DELTA_RATIO).toInt().coerceAtLeast(8)
+            val maxDh = (sb.h * MAX_GEOM_DELTA_RATIO).toInt().coerceAtLeast(8)
+
+            val geomValid = dx <= maxDx && dy <= maxDy &&
+                    dw <= maxDw && dh <= maxDh
+
+            if (!geomValid) {
+                DebugTimingLogger.logEvent(
+                    "android.pc_ocr_refine_geom_rejected",
+                    mapOf(
+                        "dx" to dx, "dy" to dy, "dw" to dw, "dh" to dh,
+                        "max_dx" to maxDx, "max_dy" to maxDy,
+                        "max_dw" to maxDw, "max_dh" to maxDh
+                    )
+                )
+            }
+
+            return RefinedResult(
+                text = refinedText,
+                box = newBox,
+                geomValid = geomValid
+            )
+        } catch (_: Exception) {
+            return null
+        }
+    }
+
+    private fun scheduleRefine(bitmap: Bitmap) {
+        var candidate: StableBlock? = null
+        for (sb in stableBlocks) {
+            val needsFirstRefine = !sb.refined
+            val needsRefresh = sb.refineCounter >= REFINE_INTERVAL_FRAMES
+            if (needsFirstRefine || needsRefresh) {
+                candidate = sb
+                break
+            }
+        }
+
+        val target = candidate ?: return
+
+        val bitmapCopy: Bitmap = try {
+            bitmap.copy(bitmap.config ?: Bitmap.Config.ARGB_8888, false)
+        } catch (_: Throwable) {
+            return
+        } ?: return
+
+        scope.launch {
+            try {
+                val result = refineBlockText(bitmapCopy, target)
+                if (result != null) {
+                    val oldText = target.text
+                    val newText = result.text
+                    val newBox = result.box
+
+                    if (newText != oldText) {
+                        Log.d(TAG, "refine text: '$oldText' -> '$newText'")
+                        DebugTimingLogger.logEvent(
+                            "android.pc_ocr_refine",
+                            mapOf("old" to oldText, "new" to newText)
+                        )
+                        target.text = newText
+                        target.pendingText = null
+                        target.pendingCount = 0
+                    }
+
+                    if (result.geomValid) {
+                        val dx = abs(newBox.left - target.x)
+                        val dy = abs(newBox.top - target.y)
+                        val dw = abs(newBox.width() - target.w)
+                        val dh = abs(newBox.height() - target.h)
+
+                        val minDx = (target.w * GEOM_APPLY_THRESHOLD_RATIO).toInt().coerceAtLeast(3)
+                        val minDy = (target.h * GEOM_APPLY_THRESHOLD_RATIO).toInt().coerceAtLeast(3)
+                        val minDw = (target.w * GEOM_APPLY_THRESHOLD_RATIO).toInt().coerceAtLeast(3)
+                        val minDh = (target.h * GEOM_APPLY_THRESHOLD_RATIO).toInt().coerceAtLeast(3)
+
+                        if (dx >= minDx || dy >= minDy ||
+                            dw >= minDw || dh >= minDh) {
+                            target.x = newBox.left
+                            target.y = newBox.top
+                            target.w = newBox.width()
+                            target.h = newBox.height()
+                            DebugTimingLogger.logEvent(
+                                "android.pc_ocr_refine_geom",
+                                mapOf(
+                                    "dx" to dx, "dy" to dy,
+                                    "dw" to dw, "dh" to dh
+                                )
+                            )
+                        }
+                    }
+                }
+                target.refined = true
+                target.refineCounter = 0
+            } catch (e: Exception) {
+                Log.w(TAG, "refine error: ${e.message}")
+            } finally {
+                try { bitmapCopy.recycle() } catch (_: Throwable) {}
+            }
+        }
+    }
+
+    private fun computeFrameHash(jpegBytes: ByteArray): Long {
+        return try {
+            val md = MessageDigest.getInstance("MD5")
+            val size = jpegBytes.size
+            val sizeBytes = byteArrayOf(
+                ((size ushr 24) and 0xFF).toByte(),
+                ((size ushr 16) and 0xFF).toByte(),
+                ((size ushr 8) and 0xFF).toByte(),
+                (size and 0xFF).toByte()
+            )
+            md.update(sizeBytes)
+            val limit = minOf(jpegBytes.size, 4096)
+            md.update(jpegBytes, 0, limit)
+            val digest = md.digest()
+            var hash: Long = 0
+            for (i in 0 until 8) {
+                hash = (hash shl 8) or (digest[i].toLong() and 0xFF)
+            }
+            hash
+        } catch (_: Exception) {
+            0L
         }
     }
 
@@ -218,7 +875,24 @@ class PcOcrService : Service(), SharedPreferences.OnSharedPreferenceChangeListen
         if (!ocrBusy.compareAndSet(false, true)) return
 
         scope.launch {
+            var bitmapForRefine: Bitmap? = null
             try {
+                val frameHash = computeFrameHash(jpegBytes)
+                val isSameFrame = (frameHash == lastFrameHash) && (frameHash != 0L)
+
+                if (isSameFrame && stableFrameStreak >= STABLE_FRAME_STREAK_LIMIT) {
+                    return@launch
+                }
+
+                if (isSameFrame) {
+                    stableFrameStreak++
+                } else {
+                    stableFrameStreak = 0
+                    lastFrameHash = frameHash
+                }
+
+                val sceneChanged = !isSameFrame
+
                 val bitmap: Bitmap? = DebugTimingLogger.timed("android.pc_ocr_decode") {
                     BitmapFactory.decodeByteArray(jpegBytes, 0, jpegBytes.size)
                 }
@@ -241,8 +915,6 @@ class PcOcrService : Service(), SharedPreferences.OnSharedPreferenceChangeListen
                     }
                 }
 
-                bitmap.recycle()
-
                 val filtered: List<OcrBlock> = if (result == null || result.blocks.isEmpty()) {
                     emptyList()
                 } else {
@@ -251,34 +923,30 @@ class PcOcrService : Service(), SharedPreferences.OnSharedPreferenceChangeListen
                         if (!isMeaningfulText(b.text)) continue
                         if (confidenceThreshold > 0f &&
                             b.confidence < confidenceThreshold) continue
+                        if (isPercentBlock(b.text)) continue
                         out.add(b)
                     }
                     out
                 }
 
-                if (result != null && filtered.isNotEmpty()) {
-                    val texts = filtered.map { it.text }
-                    DebugTimingLogger.timed("android.pc_ocr_benchmark") {
-                        benchmarkTranslator?.translateAll(texts)
+                val deduped = if (filtered.size > 1) {
+                    deduplicateOverlapping(filtered)
+                } else {
+                    filtered
+                }
+
+                val stabilized = stabilizeBlocks(deduped, sceneChanged)
+
+                if (stableBlocks.isNotEmpty()) {
+                    val needRefine = stableBlocks.any {
+                        !it.refined || it.refineCounter >= REFINE_INTERVAL_FRAMES
+                    }
+                    if (needRefine) {
+                        bitmapForRefine = bitmap
                     }
                 }
 
-                val benchmarkReady = benchmarkTranslator?.isReady() == true
-                if (!debugMode && !benchmarkReady) {
-                    if (lastSentBlocksCount > 0) {
-                        lastSentBlocksCount = 0
-                        lastMode = ""
-                        translationQueue.trySend(OcrJob(
-                            blocks = emptyList(), rawText = "",
-                            frameW = fw, frameH = fh,
-                            mode = "translate", overlayAlpha = overlayAlpha,
-                            isEmpty = true
-                        ))
-                    }
-                    return@launch
-                }
-
-                val job = if (result == null || filtered.isEmpty()) {
+                val job = if (result == null || stabilized.isEmpty()) {
                     if (lastSentBlocksCount > 0) {
                         lastSentBlocksCount = 0
                         lastMode = ""
@@ -287,23 +955,37 @@ class PcOcrService : Service(), SharedPreferences.OnSharedPreferenceChangeListen
                     } else null
                 } else {
                     val mode = if (debugMode) "debug" else "translate"
-                    OcrJob(filtered, result.text, fw, fh, mode, overlayAlpha, false)
+                    OcrJob(stabilized, result.text, fw, fh, mode, overlayAlpha, false)
                 }
 
                 if (job != null) {
                     if (!job.isEmpty) {
                         val hash = computeBlocksHash(job.blocks, job.mode, job.overlayAlpha)
-                        if (hash == queuedHash && job.mode == queuedMode) return@launch
-                        queuedHash = hash
-                        queuedMode = job.mode
-                    }
-                    if (!translationQueue.trySend(job).isSuccess) {
-                        droppedCount.incrementAndGet()
+                        if (hash == queuedHash && job.mode == queuedMode) {
+                            // skip
+                        } else {
+                            queuedHash = hash
+                            queuedMode = job.mode
+                            if (!translationQueue.trySend(job).isSuccess) {
+                                droppedCount.incrementAndGet()
+                            }
+                        }
+                    } else {
+                        if (!translationQueue.trySend(job).isSuccess) {
+                            droppedCount.incrementAndGet()
+                        }
                     }
                 }
             } catch (e: Exception) {
                 Log.e(TAG, "onFrame error", e)
             } finally {
+                val bmpRef = bitmapForRefine
+                if (bmpRef != null) {
+                    try {
+                        scheduleRefine(bmpRef)
+                    } catch (_: Throwable) {}
+                }
+                try { bmpRef?.recycle() } catch (_: Throwable) {}
                 ocrBusy.set(false)
             }
         }
@@ -330,20 +1012,49 @@ class PcOcrService : Service(), SharedPreferences.OnSharedPreferenceChangeListen
                 return
             }
 
-            val translated = benchmarkTranslator?.translateAll(
-                job.blocks.map { it.text }) ?: emptyList()
-            val map = translated.toMap()
-            val outBlocks = job.blocks.mapNotNull { block ->
-                val t = map[block.text] ?: return@mapNotNull null
-                block.copy(text = t)
+            val outBlocks = ArrayList<OcrBlock>(job.blocks.size)
+            val needTranslate = ArrayList<String>(job.blocks.size)
+            val blockByText = HashMap<String, MutableList<OcrBlock>>(job.blocks.size)
+
+            for (block in job.blocks) {
+                val cached = translationCache[block.text]
+                if (cached != null) {
+                    outBlocks.add(block.copy(text = cached))
+                } else {
+                    needTranslate.add(block.text)
+                    blockByText.getOrPut(block.text) { mutableListOf() }.add(block)
+                }
+            }
+
+            if (needTranslate.isNotEmpty()) {
+                val translated = benchmarkTranslator?.translateAll(needTranslate)
+                    ?: emptyList()
+                for ((orig, dst) in translated) {
+                    if (dst.isBlank()) continue
+                    translationCache[orig] = dst
+                    val blocks = blockByText[orig]
+                    if (blocks != null) {
+                        for (b in blocks) {
+                            outBlocks.add(b.copy(text = dst))
+                        }
+                    }
+                }
+                if (translationCache.size > TRANSLATION_CACHE_MAX) {
+                    val it = translationCache.entries.iterator()
+                    var toRemove = translationCache.size - TRANSLATION_CACHE_MAX
+                    while (it.hasNext() && toRemove > 0) {
+                        it.next()
+                        it.remove()
+                        toRemove--
+                    }
+                }
             }
 
             blockCount = outBlocks.size
+
             if (outBlocks.isEmpty()) {
-                sender?.send(OcrResult(job.rawText, emptyList()),
-                    job.frameW, job.frameH, "translate", job.overlayAlpha, force = true)
-                lastSentBlocksCount = 0
-                lastMode = ""
+                DebugTimingLogger.logEvent("android.pc_ocr_no_translations",
+                    mapOf("total" to job.blocks.size))
                 return
             }
 
@@ -403,6 +1114,8 @@ class PcOcrService : Service(), SharedPreferences.OnSharedPreferenceChangeListen
         sender = null
         benchmarkTranslator?.close()
         benchmarkTranslator = null
+        stableBlocks.clear()
+        translationCache.clear()
         scope.coroutineContext[Job]?.cancel()
         super.onDestroy()
     }
@@ -413,7 +1126,112 @@ class PcOcrService : Service(), SharedPreferences.OnSharedPreferenceChangeListen
         private const val TAG = "PcOcrService"
         private const val NOTIFICATION_ID = 2
         const val EXTRA_ENGINE = "engine"
-        private const val COORD_BUCKET = 10
+        private const val COORD_BUCKET = 2
+
+        private const val STABLE_IOU_THRESHOLD = 0.3
+        private const val CENTER_MATCH_DIST = 60.0
+        private const val CONTAINMENT_MARGIN = 0.3
+        private const val STABLE_MISS_LIMIT = 2L
+        private const val STABLE_TEXT_UPDATE_THRESHOLD = 2
+
+        private const val POS_CHANGE_THRESHOLD = 3
+        private const val SIZE_CHANGE_THRESHOLD = 5
+
+        private const val REFINE_INTERVAL_FRAMES = 60
+        private const val REFINE_SCALE = 2
+
+        private const val DEDUP_OVERLAP_RATIO = 0.5
+
+        private const val STABLE_FRAME_STREAK_LIMIT = 4
+
+        private const val TRANSLATION_CACHE_MAX = 1000
+
+        private const val REFINE_PADDING_MAX = 15
+
+        private const val MAX_GEOM_DELTA_RATIO = 0.5
+
+        private const val GEOM_APPLY_THRESHOLD_RATIO = 0.1
+
+        private val NORMALIZE_SKIP_WORDS = setOf(
+            "A", "An", "The", "I"
+        )
+
+        private val NORMALIZE_LEAD_REGEX = Regex("^([A-Za-z0-9]{1,3})\\s+([A-Z].*)$")
+        private val NORMALIZE_TRAIL_REGEX = Regex("^(.*[a-zа-яё.,!?])\\s+([A-Za-z0-9]{1,2})$")
+
+        private val TRAILING_VOWELS = setOf(
+            'a', 'o', 'e', 'u', 'i', 'y'
+        )
+
+        private val CONSONANTS = setOf(
+            'r', 't', 'l', 'n', 'm', 'p', 'k', 'g', 'd', 'f', 'v', 's', 'z', 'h', 'j',
+            'b', 'c', 'q', 'w', 'x'
+        )
+
+        private val NORMALIZE_WHITELIST = setOf(
+            "menu", "game", "file", "mode", "code", "name", "time", "line",
+            "size", "value", "image", "page", "message", "language",
+            "move", "love", "live", "save", "have", "give", "take", "make",
+            "like", "life", "wife", "knife", "safe", "cafe", "case", "base",
+            "place", "space", "face", "race", "pace", "grace", "trace",
+            "price", "nice", "rice", "ice", "slice", "twice", "once",
+            "since", "hence", "whence", "thence",
+            "true", "blue", "clue", "due", "hue", "sue", "cue", "argue",
+            "value", "issue", "rescue", "venue", "avenue", "revenue",
+            "continue", "menu", "venue", "residue", "statue", "virtue",
+            "age", "image", "page", "stage", "rage", "cage", "wage",
+            "language", "message", "village", "college", "knowledge",
+            "manage", "package", "garbage", "cabbage", "sausage",
+            "orange", "range", "change", "strange", "arrange",
+            "large", "charge", "barge", "marge", "targe",
+            "there", "where", "here", "mere", "sere", "were",
+            "done", "gone", "none", "one", "some", "come", "become",
+            "love", "above", "dove", "glove", "shove", "move", "prove",
+            "have", "gave", "save", "wave", "cave", "pave", "rave", "brave",
+            "leave", "weave", "heave", "cleave", "sleeve", "believe",
+            "receive", "deceive", "perceive", "conceive",
+            "write", "white", "quite", "quote", "note", "vote", "hope",
+            "home", "come", "some", "done", "gone", "none", "one",
+            "more", "before", "therefore", "wherefore", "store", "score",
+            "shore", "snore", "swore", "tore", "wore", "bore", "core",
+            "sure", "pure", "cure", "lure", "sure", "endure", "secure",
+            "nature", "future", "picture", "culture", "structure",
+            "figure", "failure", "measure", "treasure", "pleasure",
+            "feature", "creature", "theatre", "centre", "metre",
+            "nintendo", "wii", "remote", "chapter", "start", "select",
+            "cancel", "confirm", "delete", "copy", "extras", "speed",
+            "max", "radiant", "dawn", "emblem", "fire",
+            "area", "idea", "media", "data", "extra", "ultra",
+            "alpha", "beta", "gamma", "delta", "sigma", "omega",
+            "anna", "ella", "emma", "olga", "irina", "sveta",
+            "nata", "rita", "liza", "vika", "nina", "mila",
+            "kira", "lara", "mara", "sara", "tara", "zara",
+            "cara", "clara", "laura", "aura", "flora", "nora",
+            "dora", "lora", "bora", "gora", "pora", "tora",
+            "vora", "zora",
+            "africa", "america", "asia", "europa", "russia",
+            "china", "india", "japan", "korea", "canada",
+            "australia", "brasil", "brazil", "argentina", "mexico",
+            "cuba", "peru", "chile", "bolivia", "venezuela",
+            "colombia", "ecuador", "uruguay", "paraguay", "panama",
+            "costa", "rica", "guatemala", "honduras", "nicaragua",
+            "salvador", "belize", "haiti", "jamaica", "bahamas",
+            "barbados", "grenada", "dominica", "st", "lucia",
+            "vincent", "grenadines", "antigua", "barbuda", "kitts",
+            "nevis", "trinidad", "tobago", "guyana", "suriname",
+            "french", "guiana", "falkland", "islands", "galapagos",
+            "easter", "island", "hawaii", "alaska", "california",
+            "florida", "texas", "montana", "indiana", "iowa",
+            "ohio", "utah", "alabama", "arizona", "arkansas",
+            "colorado", "connecticut", "delaware", "georgia", "idaho",
+            "illinois", "kansas", "kentucky", "louisiana", "maine",
+            "maryland", "massachusetts", "michigan", "minnesota",
+            "mississippi", "missouri", "nebraska", "nevada", "new",
+            "hampshire", "jersey", "mexico", "york", "carolina",
+            "dakota", "oklahoma", "oregon", "pennsylvania", "rhode",
+            "tennessee", "vermont", "virginia", "washington",
+            "wisconsin", "wyoming"
+        )
 
         private val URL_REGEX = Regex(
             """(https?://|www\.|[a-z0-9\-]+\.(com|ru|org|net|io|dev|edu|gov)\b)""",
@@ -561,6 +1379,21 @@ class PcOcrService : Service(), SharedPreferences.OnSharedPreferenceChangeListen
                 } else {
                     if (wordStart != -1) {
                         val wordLen = i - wordStart
+
+                        if (wordIsLatin && !wordHasDigit && wordLen >= 2) {
+                            var hasUpperMid = false
+                            var allUpper = true
+                            for (j in wordStart until i) {
+                                val cj = t[j]
+                                if (cj in 'A'..'Z') {
+                                    if (j > wordStart) hasUpperMid = true
+                                } else {
+                                    allUpper = false
+                                }
+                            }
+                            if (hasUpperMid && !allUpper) return false
+                        }
+
                         if (wordHasDigit && wordLen >= 4) {
                             return false
                         }
@@ -575,7 +1408,6 @@ class PcOcrService : Service(), SharedPreferences.OnSharedPreferenceChangeListen
                             }
                             if (!hasSuffix) {
                                 var bigrams = 0
-                                var upperMid = 0
                                 var j = wordStart
                                 while (j < i - 1) {
                                     val c1 = t[j].lowercaseChar()
@@ -588,13 +1420,7 @@ class PcOcrService : Service(), SharedPreferences.OnSharedPreferenceChangeListen
                                     }
                                     j++
                                 }
-                                j = wordStart + 1
-                                while (j < i) {
-                                    if (t[j] in 'A'..'Z') upperMid++
-                                    j++
-                                }
                                 if (bigrams < 3) return false
-                                if (upperMid >= 2) return false
                             }
                         }
                         wordStart = -1

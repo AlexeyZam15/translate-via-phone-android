@@ -263,8 +263,6 @@ class OverlayService : Service(), SharedPreferences.OnSharedPreferenceChangeList
                     return@launch
                 }
 
-                // ИЗМЕНЕНО: при !translator.isReady() показываем debug-зоны
-                // (сырой OCR), а не пытаемся показать "перевод" из OCR-текста.
                 if (debugMode || translator?.isReady() != true) {
                     blockCount = filtered.size
                     DebugTimingLogger.timed("android.overlay_show_zones") {
@@ -318,7 +316,10 @@ class OverlayService : Service(), SharedPreferences.OnSharedPreferenceChangeList
         hideZones()
 
         val view = ZoneOverlayView(this)
-        view.setBlocks(blocks, sourceW, sourceH, showConfidence, showTranslation, overlayAlpha)
+        // ИЗМЕНЕНО: передаём текущий padding, чтобы в debug-режиме
+        // можно было видеть расширенный bbox.
+        view.setBlocks(blocks, sourceW, sourceH, showConfidence, showTranslation,
+            overlayAlpha, Settings.getOcrPadding(this))
 
         val params = WindowManager.LayoutParams(
             WindowManager.LayoutParams.MATCH_PARENT,

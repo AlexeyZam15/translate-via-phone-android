@@ -23,8 +23,6 @@ import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
-import org.json.JSONArray
-import org.json.JSONObject
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
@@ -44,7 +42,6 @@ class OcrTranslator(
     @Volatile private var serverEndpoint: String = Settings.getTranslateEndpoint(context)
 
     private val httpFailures = AtomicInteger(0)
-    private val MAX_HTTP_FAILURES = 3
 
     // ML Kit
     private val languageIdentifier: LanguageIdentifier = LanguageIdentification.getClient()
@@ -66,12 +63,22 @@ class OcrTranslator(
         .build()
     private val jsonMedia = "application/json; charset=utf-8".toMediaType()
 
-    private data class CacheEntry(val value: String?)
-    private val cache = ConcurrentHashMap<String, CacheEntry>()
-    private val sourceLangCache = ConcurrentHashMap<String, String>()
+    // Кэш успешных переводов: original -> translated.
+    private val cache = ConcurrentHashMap<String, String>()
 
-    // ИЗМЕНЕНО: таймаут warmup увеличен с 1500 до 3000 ms
+    // Кэш неудачных попыток. Хранит timestamp последней неудачи.
+    // Если с последней неудачи прошло < FAILED_RETRY_DELAY_MS —
+    // блок пропускается (не пытаемся перевести снова).
+    private val failedCache = ConcurrentHashMap<String, Long>()
+
     private val WARMUP_TIMEOUT_MS = 3000L
+    private val TRANSLATE_TIMEOUT_MS = 8000L
+
+    // ИЗМЕНЕНО: 3000 → 1500. Если текст вернулся к «неудачному»,
+    // повторная попытка через 1.5 сек вместо 3 сек.
+    private val FAILED_RETRY_DELAY_MS = 1500L
+
+    private val FAILED_CACHE_MAX = 500
 
     suspend fun prepare() {
         DebugTimingLogger.timed("android.translator_prepare") {
@@ -205,7 +212,6 @@ class OcrTranslator(
         DebugTimingLogger.timed("android.translator_warmup",
             mapOf("source" to source, "target" to target, "size" to mlkitPoolSize)) {
             try {
-                // ИЗМЕНЕНО: 1500 → 3000 ms
                 withTimeoutOrNull(WARMUP_TIMEOUT_MS) {
                     coroutineScope {
                         deque.map { translator ->
@@ -269,7 +275,6 @@ class OcrTranslator(
             return TranslateLanguage.fromLanguageTag(fixedSourceLang) ?: TranslateLanguage.ENGLISH
         }
         detectedSourceLangCache?.let { return it }
-        sourceLangCache[text]?.let { return it }
 
         return DebugTimingLogger.timed("android.translator_detect_lang") {
             val tagLang = try {
@@ -283,9 +288,6 @@ class OcrTranslator(
                 TranslateLanguage.fromLanguageTag(tagLang) ?: TranslateLanguage.ENGLISH
             }
             detectedSourceLangCache = lang
-            if (sourceLangCache.size < 200) {
-                sourceLangCache[text] = lang
-            }
             lang
         }
     }
@@ -296,12 +298,10 @@ class OcrTranslator(
         if (text.length < 3) return null
         if (!ready.get()) return null
 
-        cache[text]?.let { return it.value }
+        cache[text]?.let { return it }
 
         val result = translateAll(listOf(text))
-        val found = result.firstOrNull { it.first == text }?.second
-        if (cache.size < 2000) cache[text] = CacheEntry(found)
-        return found
+        return result.firstOrNull { it.first == text }?.second
     }
 
     suspend fun translateAll(texts: List<String>): List<Pair<String, String>> {
@@ -312,13 +312,21 @@ class OcrTranslator(
             val valid = texts.filter { it.isNotBlank() && hasLetters(it) && it.length >= 3 }
             if (valid.isEmpty()) return emptyList()
 
+            val now = System.currentTimeMillis()
             val result = ArrayList<Pair<String, String>>(valid.size)
             val toTranslate = ArrayList<String>(valid.size)
+
             for (t in valid) {
                 val cached = cache[t]
                 if (cached != null) {
-                    if (cached.value != null) result.add(t to cached.value!!)
-                } else if (!toTranslate.contains(t)) {
+                    result.add(t to cached)
+                    continue
+                }
+                val failedAt = failedCache[t]
+                if (failedAt != null && now - failedAt < FAILED_RETRY_DELAY_MS) {
+                    continue
+                }
+                if (!toTranslate.contains(t)) {
                     toTranslate.add(t)
                 }
             }
@@ -329,7 +337,9 @@ class OcrTranslator(
             }
 
             if (sourceLang == targetLang) {
-                for (t in toTranslate) cache[t] = CacheEntry(null)
+                for (t in toTranslate) {
+                    failedCache[t] = now
+                }
                 return result
             }
 
@@ -347,7 +357,7 @@ class OcrTranslator(
                         }
                         try {
                             val r = try {
-                                withTimeoutOrNull(500L) {
+                                withTimeoutOrNull(TRANSLATE_TIMEOUT_MS) {
                                     translator.translate(t).awaitT()
                                 }
                             } catch (ex: Throwable) {
@@ -362,13 +372,34 @@ class OcrTranslator(
             }
 
             for ((orig, tr) in translated) {
-                if (tr == null || tr.trim().equals(orig.trim(), ignoreCase = true)) {
-                    cache[orig] = CacheEntry(null)
-                } else {
-                    cache[orig] = CacheEntry(tr)
-                    result.add(orig to tr)
+                if (tr == null) {
+                    failedCache[orig] = now
+                    continue
+                }
+                val trimmed = tr.trim()
+                if (trimmed.isEmpty()) {
+                    failedCache[orig] = now
+                    continue
+                }
+                if (trimmed.equals(orig.trim(), ignoreCase = true)) {
+                    failedCache[orig] = now
+                    continue
+                }
+                failedCache.remove(orig)
+                cache[orig] = trimmed
+                result.add(orig to trimmed)
+            }
+
+            if (failedCache.size > FAILED_CACHE_MAX) {
+                val it = failedCache.entries.iterator()
+                var toRemove = failedCache.size - FAILED_CACHE_MAX
+                while (it.hasNext() && toRemove > 0) {
+                    it.next()
+                    it.remove()
+                    toRemove--
                 }
             }
+
             return result
         } finally {
             val ms = (System.nanoTime() - tTotal) / 1_000_000.0
@@ -393,7 +424,7 @@ class OcrTranslator(
             translatorPool.clear()
         }
         cache.clear()
-        sourceLangCache.clear()
+        failedCache.clear()
         modelReadyCache.clear()
         detectedSourceLangCache = null
         ready.set(false)
