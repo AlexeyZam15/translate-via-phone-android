@@ -79,8 +79,6 @@ class PcOcrService : Service(), SharedPreferences.OnSharedPreferenceChangeListen
     @Volatile private var queuedMode: String = ""
 
     // Флаг принудительного refine после смены ocr_padding.
-    // При true onFrame не выходит по STABLE_FRAME_STREAK_LIMIT,
-    // чтобы scheduleRefine мог обработать блоки со сброшенным refined.
     @Volatile private var forceRefine: Boolean = false
 
     private var engineType: OcrType = OcrType.ML_KIT
@@ -318,6 +316,14 @@ class PcOcrService : Service(), SharedPreferences.OnSharedPreferenceChangeListen
         var t = raw.trim()
         if (t.isEmpty()) return t
 
+        // ИЗМЕНЕНО: сначала удаляем все цифры и двоеточия
+        // (таймеры, счётчики времени), схлопываем пробелы.
+        // "Time 38:17:16" → "Time" — слово переводится,
+        // а цифры/":" не попадают в оверлей.
+        // "38:17:16" → "" → блок отбрасывается по isEmpty.
+        t = stripDigitsAndColons(t)
+        if (t.isEmpty()) return t
+
         val leadMatch = NORMALIZE_LEAD_REGEX.find(t)
         if (leadMatch != null) {
             val prefix = leadMatch.groupValues[1]
@@ -535,13 +541,8 @@ class PcOcrService : Service(), SharedPreferences.OnSharedPreferenceChangeListen
             sb.lastSeenFrame = frameCounter
             sb.refineCounter++
 
-            // ИЗМЕНЕНО: если блок уже прошёл refine — не затираем его
-            // уточнённый текст и геометрию OCR-шумом. Refine даёт
-            // уточнённый текст (например, "details." вместо "det")
-            // и уточнённые границы (расширенные с учётом ocr_padding).
-            // Без этой защиты stabilizeBlocks откатывал бы их обратно
-            // через STABLE_TEXT_UPDATE_THRESHOLD (что и наблюдалось:
-            // "details." → "det" через 2 кадра).
+            // Если блок уже прошёл refine — не затираем его уточнённый
+            // текст и геометрию OCR-шумом.
             if (!sb.refined) {
                 if (newText == sb.text) {
                     sb.pendingText = null
@@ -564,10 +565,6 @@ class PcOcrService : Service(), SharedPreferences.OnSharedPreferenceChangeListen
                 if (abs(nbR.width() - sb.w) >= SIZE_CHANGE_THRESHOLD) sb.w = nbR.width()
                 if (abs(nbR.height() - sb.h) >= SIZE_CHANGE_THRESHOLD) sb.h = nbR.height()
             } else {
-                // Блок refined — не трогаем ни текст, ни геометрию.
-                // Обновление произойдёт при следующем refine
-                // (refineCounter >= REFINE_INTERVAL_FRAMES) или при сбросе
-                // refined (смена ocr_padding/debug/языка/scene change).
                 sb.pendingText = null
                 sb.pendingCount = 0
             }
@@ -793,8 +790,6 @@ class PcOcrService : Service(), SharedPreferences.OnSharedPreferenceChangeListen
     private fun scheduleRefine(bitmap: Bitmap) {
         var candidate: StableBlock? = null
 
-        // При forceRefine сначала ищем блоки с refined == false
-        // (после смены ocr_padding), иначе — обычная логика.
         if (forceRefine) {
             for (sb in stableBlocks) {
                 if (!sb.refined) {
@@ -874,11 +869,9 @@ class PcOcrService : Service(), SharedPreferences.OnSharedPreferenceChangeListen
                 target.refined = true
                 target.refineCounter = 0
 
-                // ИЗМЕНЕНО: после успешного refine принудительно отправляем
+                // После успешного refine принудительно отправляем
                 // актуальные stableBlocks на ПК, чтобы оверлей сразу
                 // перерисовался с уточнённым текстом и расширенной рамкой.
-                // Иначе приходилось бы ждать следующего onFrame, а на
-                // статичной картинке его может не быть долго.
                 trySendCurrentStableBlocks(frameW, frameH)
             } catch (e: Exception) {
                 Log.w(TAG, "refine error: ${e.message}")
@@ -958,9 +951,6 @@ class PcOcrService : Service(), SharedPreferences.OnSharedPreferenceChangeListen
                 val frameHash = computeFrameHash(jpegBytes)
                 val isSameFrame = (frameHash == lastFrameHash) && (frameHash != 0L)
 
-                // forceRefine пропускает ранний выход по статичному кадру.
-                // Иначе на статичной картинке refine не запустится после
-                // смены ocr_padding.
                 val allowStatic = forceRefine
                 if (isSameFrame && stableFrameStreak >= STABLE_FRAME_STREAK_LIMIT
                     && !allowStatic) {
@@ -1003,11 +993,17 @@ class PcOcrService : Service(), SharedPreferences.OnSharedPreferenceChangeListen
                 } else {
                     val out = ArrayList<OcrBlock>(result.blocks.size)
                     for (b in result.blocks) {
-                        if (!isMeaningfulText(b.text)) continue
+                        // Сначала нормализуем — цифры и двоеточия удаляются
+                        // прямо здесь (stripDigitsAndColons внутри normalizeText).
+                        val norm = normalizeText(b.text)
+                        if (norm.isEmpty()) continue
+                        val normalizedBlock = b.copy(text = norm)
+
+                        if (!isMeaningfulText(normalizedBlock.text)) continue
                         if (confidenceThreshold > 0f &&
-                            b.confidence < confidenceThreshold) continue
-                        if (isPercentBlock(b.text)) continue
-                        out.add(b)
+                            normalizedBlock.confidence < confidenceThreshold) continue
+                        if (isPercentBlock(normalizedBlock.text)) continue
+                        out.add(normalizedBlock)
                     }
                     out
                 }
@@ -1069,9 +1065,6 @@ class PcOcrService : Service(), SharedPreferences.OnSharedPreferenceChangeListen
                     } catch (_: Throwable) {}
                 }
                 try { bmpRef?.recycle() } catch (_: Throwable) {}
-                // Сбрасываем forceRefine после обработки кадра.
-                // refine уже запланирован (или запустится на следующем
-                // кадре через обычную логику).
                 forceRefine = false
                 ocrBusy.set(false)
             }
@@ -1361,6 +1354,33 @@ class PcOcrService : Service(), SharedPreferences.OnSharedPreferenceChangeListen
             "ic", "ive", "ish", "en", "an", "ary", "ory", "ize", "ise",
             "ate", "y", "ies", "ied", "ier", "iest", "able", "ible"
         )
+
+        /**
+         * Удаляет из строки все цифры 0-9 и все ':'.
+         * Множественные пробелы схлопываются в один,
+         * пробелы по краям обрезаются.
+         *
+         * Примеры:
+         *   "Time 38:17:16"     → "Time"
+         *   "38 : 17: 16"       → ""
+         *   "Max:"              → "Max"
+         *   "HP: 100"           → "HP"
+         *   "Clear Data"        → "Clear Data"
+         */
+        fun stripDigitsAndColons(raw: String): String {
+            if (raw.isEmpty()) return ""
+            val sb = StringBuilder(raw.length)
+            for (c in raw) {
+                when {
+                    c in '0'..'9' -> { /* skip */ }
+                    c == ':' -> { /* skip */ }
+                    else -> sb.append(c)
+                }
+            }
+            // Схлопываем пробелы и обрезаем по краям.
+            val collapsed = sb.toString().replace(Regex("\\s+"), " ").trim()
+            return collapsed
+        }
 
         fun isMeaningfulText(raw: String): Boolean {
             val t = raw.trim()
