@@ -78,6 +78,11 @@ class PcOcrService : Service(), SharedPreferences.OnSharedPreferenceChangeListen
     @Volatile private var queuedHash: Int = 0
     @Volatile private var queuedMode: String = ""
 
+    // Флаг принудительного refine после смены ocr_padding.
+    // При true onFrame не выходит по STABLE_FRAME_STREAK_LIMIT,
+    // чтобы scheduleRefine мог обработать блоки со сброшенным refined.
+    @Volatile private var forceRefine: Boolean = false
+
     private var engineType: OcrType = OcrType.ML_KIT
     private var confidenceThreshold: Float = 0f
     private var sourceLang: String? = null
@@ -250,10 +255,15 @@ class PcOcrService : Service(), SharedPreferences.OnSharedPreferenceChangeListen
             }
         }
         if (key == Settings.KEY_OCR_PADDING) {
+            // Сбрасываем refined, чтобы refineBlockText пересчитал crop
+            // с новым padding. И ставим forceRefine, чтобы onFrame
+            // не выходил по STABLE_FRAME_STREAK_LIMIT на статичной картинке.
             for (sb in stableBlocks) {
                 sb.refined = false
                 sb.refineCounter = 0
             }
+            forceRefine = true
+            DebugTimingLogger.logEvent("android.pc_ocr_force_refine_on_padding")
         }
     }
 
@@ -522,37 +532,45 @@ class PcOcrService : Service(), SharedPreferences.OnSharedPreferenceChangeListen
                 continue
             }
 
-            // ИЗМЕНЕНО: точное сравнение текста, БЕЗ textsAreSimilar.
-            // Если текст реально изменился (даже на 1 символ) —
-            // pendingCount начинает накапливаться и через
-            // STABLE_TEXT_UPDATE_THRESHOLD кадров sb.text обновится.
-            // Раньше textsAreSimilar возвращал true для похожих текстов,
-            // pendingCount сбрасывался, и старый текст оставался навсегда.
-            if (newText == sb.text) {
-                sb.pendingText = null
-                sb.pendingCount = 0
-            } else if (newText == sb.pendingText) {
-                sb.pendingCount++
-                if (sb.pendingCount >= STABLE_TEXT_UPDATE_THRESHOLD) {
-                    sb.text = newText
-                    sb.pendingText = null
-                    sb.pendingCount = 0
-                }
-            } else {
-                sb.pendingText = newText
-                sb.pendingCount = 1
-            }
-
             sb.lastSeenFrame = frameCounter
             sb.refineCounter++
 
-            // Обновляем геометрию при сдвиге на 3+ пикселя
-            // и изменении размера на 5+ пикселей.
-            val nbR = nb.boundingBox
-            if (abs(nbR.left - sb.x) >= POS_CHANGE_THRESHOLD) sb.x = nbR.left
-            if (abs(nbR.top - sb.y) >= POS_CHANGE_THRESHOLD) sb.y = nbR.top
-            if (abs(nbR.width() - sb.w) >= SIZE_CHANGE_THRESHOLD) sb.w = nbR.width()
-            if (abs(nbR.height() - sb.h) >= SIZE_CHANGE_THRESHOLD) sb.h = nbR.height()
+            // ИЗМЕНЕНО: если блок уже прошёл refine — не затираем его
+            // уточнённый текст и геометрию OCR-шумом. Refine даёт
+            // уточнённый текст (например, "details." вместо "det")
+            // и уточнённые границы (расширенные с учётом ocr_padding).
+            // Без этой защиты stabilizeBlocks откатывал бы их обратно
+            // через STABLE_TEXT_UPDATE_THRESHOLD (что и наблюдалось:
+            // "details." → "det" через 2 кадра).
+            if (!sb.refined) {
+                if (newText == sb.text) {
+                    sb.pendingText = null
+                    sb.pendingCount = 0
+                } else if (newText == sb.pendingText) {
+                    sb.pendingCount++
+                    if (sb.pendingCount >= STABLE_TEXT_UPDATE_THRESHOLD) {
+                        sb.text = newText
+                        sb.pendingText = null
+                        sb.pendingCount = 0
+                    }
+                } else {
+                    sb.pendingText = newText
+                    sb.pendingCount = 1
+                }
+
+                val nbR = nb.boundingBox
+                if (abs(nbR.left - sb.x) >= POS_CHANGE_THRESHOLD) sb.x = nbR.left
+                if (abs(nbR.top - sb.y) >= POS_CHANGE_THRESHOLD) sb.y = nbR.top
+                if (abs(nbR.width() - sb.w) >= SIZE_CHANGE_THRESHOLD) sb.w = nbR.width()
+                if (abs(nbR.height() - sb.h) >= SIZE_CHANGE_THRESHOLD) sb.h = nbR.height()
+            } else {
+                // Блок refined — не трогаем ни текст, ни геометрию.
+                // Обновление произойдёт при следующем refine
+                // (refineCounter >= REFINE_INTERVAL_FRAMES) или при сбросе
+                // refined (смена ocr_padding/debug/языка/scene change).
+                sb.pendingText = null
+                sb.pendingCount = 0
+            }
 
             result.add(
                 OcrBlock(
@@ -774,12 +792,25 @@ class PcOcrService : Service(), SharedPreferences.OnSharedPreferenceChangeListen
 
     private fun scheduleRefine(bitmap: Bitmap) {
         var candidate: StableBlock? = null
-        for (sb in stableBlocks) {
-            val needsFirstRefine = !sb.refined
-            val needsRefresh = sb.refineCounter >= REFINE_INTERVAL_FRAMES
-            if (needsFirstRefine || needsRefresh) {
-                candidate = sb
-                break
+
+        // При forceRefine сначала ищем блоки с refined == false
+        // (после смены ocr_padding), иначе — обычная логика.
+        if (forceRefine) {
+            for (sb in stableBlocks) {
+                if (!sb.refined) {
+                    candidate = sb
+                    break
+                }
+            }
+        }
+        if (candidate == null) {
+            for (sb in stableBlocks) {
+                val needsFirstRefine = !sb.refined
+                val needsRefresh = sb.refineCounter >= REFINE_INTERVAL_FRAMES
+                if (needsFirstRefine || needsRefresh) {
+                    candidate = sb
+                    break
+                }
             }
         }
 
@@ -790,6 +821,9 @@ class PcOcrService : Service(), SharedPreferences.OnSharedPreferenceChangeListen
         } catch (_: Throwable) {
             return
         } ?: return
+
+        val frameW = bitmap.width
+        val frameH = bitmap.height
 
         scope.launch {
             try {
@@ -839,11 +873,55 @@ class PcOcrService : Service(), SharedPreferences.OnSharedPreferenceChangeListen
                 }
                 target.refined = true
                 target.refineCounter = 0
+
+                // ИЗМЕНЕНО: после успешного refine принудительно отправляем
+                // актуальные stableBlocks на ПК, чтобы оверлей сразу
+                // перерисовался с уточнённым текстом и расширенной рамкой.
+                // Иначе приходилось бы ждать следующего onFrame, а на
+                // статичной картинке его может не быть долго.
+                trySendCurrentStableBlocks(frameW, frameH)
             } catch (e: Exception) {
                 Log.w(TAG, "refine error: ${e.message}")
             } finally {
                 try { bitmapCopy.recycle() } catch (_: Throwable) {}
             }
+        }
+    }
+
+    /**
+     * Принудительная отправка актуальных stableBlocks на ПК.
+     * Используется после refine, чтобы оверлей сразу увидел
+     * обновлённый текст и геометрию (без ожидания onFrame).
+     */
+    private fun trySendCurrentStableBlocks(frameW: Int, frameH: Int) {
+        try {
+            if (stableBlocks.isEmpty()) return
+            val mode = if (debugMode) "debug" else "translate"
+
+            val blocksOut = ArrayList<OcrBlock>(stableBlocks.size)
+            for (sb in stableBlocks) {
+                if (sb.text.isEmpty()) continue
+                blocksOut.add(
+                    OcrBlock(
+                        text = sb.text,
+                        boundingBox = Rect(sb.x, sb.y, sb.x + sb.w, sb.y + sb.h),
+                        confidence = 0f,
+                        initialBoundingBox = Rect(sb.x, sb.y, sb.x + sb.w, sb.y + sb.h)
+                    )
+                )
+            }
+            if (blocksOut.isEmpty()) return
+
+            val hash = computeBlocksHash(blocksOut, mode, overlayAlpha)
+            if (hash == queuedHash && mode == queuedMode) return
+
+            queuedHash = hash
+            queuedMode = mode
+            val job = OcrJob(blocksOut, "", frameW, frameH, mode, overlayAlpha, false)
+            if (!translationQueue.trySend(job).isSuccess) {
+                droppedCount.incrementAndGet()
+            }
+        } catch (_: Throwable) {
         }
     }
 
@@ -880,7 +958,12 @@ class PcOcrService : Service(), SharedPreferences.OnSharedPreferenceChangeListen
                 val frameHash = computeFrameHash(jpegBytes)
                 val isSameFrame = (frameHash == lastFrameHash) && (frameHash != 0L)
 
-                if (isSameFrame && stableFrameStreak >= STABLE_FRAME_STREAK_LIMIT) {
+                // forceRefine пропускает ранний выход по статичному кадру.
+                // Иначе на статичной картинке refine не запустится после
+                // смены ocr_padding.
+                val allowStatic = forceRefine
+                if (isSameFrame && stableFrameStreak >= STABLE_FRAME_STREAK_LIMIT
+                    && !allowStatic) {
                     return@launch
                 }
 
@@ -986,6 +1069,10 @@ class PcOcrService : Service(), SharedPreferences.OnSharedPreferenceChangeListen
                     } catch (_: Throwable) {}
                 }
                 try { bmpRef?.recycle() } catch (_: Throwable) {}
+                // Сбрасываем forceRefine после обработки кадра.
+                // refine уже запланирован (или запустится на следующем
+                // кадре через обычную логику).
+                forceRefine = false
                 ocrBusy.set(false)
             }
         }

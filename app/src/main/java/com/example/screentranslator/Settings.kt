@@ -38,7 +38,9 @@ object Settings {
     const val DEFAULT_SOURCE_LANG = ""
     const val DEFAULT_TARGET_LANG = "ru"
     const val DEFAULT_OVERLAY_ALPHA = 0
-    const val DEFAULT_OCR_PADDING = 10
+
+    // ИЗМЕНЕНО: 10 → 11 (по умолчанию отступ OCR 11 %).
+    const val DEFAULT_OCR_PADDING = 11
 
     const val DEFAULT_DEBUG_TIMING_ENABLED = true
     const val DEFAULT_DEBUG_VERBOSE = false
