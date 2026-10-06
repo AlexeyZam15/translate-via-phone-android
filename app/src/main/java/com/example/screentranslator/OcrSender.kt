@@ -89,8 +89,6 @@ class OcrSender(private val pcUrl: String) {
             .post(body)
             .build()
 
-        // Асинхронный запрос — НЕ блокирует вызывающий поток.
-        // Это позволяет циклу OCR/перевода работать без пауз на отправку.
         val tStart = System.nanoTime()
         client.newCall(request).enqueue(object : Callback {
             override fun onFailure(call: Call, e: IOException) {

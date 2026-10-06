@@ -43,7 +43,6 @@ class OcrTranslator(
 
     private val httpFailures = AtomicInteger(0)
 
-    // ML Kit
     private val languageIdentifier: LanguageIdentifier = LanguageIdentification.getClient()
     private val modelManager = RemoteModelManager.getInstance()
     private val modelReadyCache = ConcurrentHashMap<String, Boolean>()
@@ -63,21 +62,13 @@ class OcrTranslator(
         .build()
     private val jsonMedia = "application/json; charset=utf-8".toMediaType()
 
-    // Кэш успешных переводов: original -> translated.
     private val cache = ConcurrentHashMap<String, String>()
 
-    // Кэш неудачных попыток. Хранит timestamp последней неудачи.
-    // Если с последней неудачи прошло < FAILED_RETRY_DELAY_MS —
-    // блок пропускается (не пытаемся перевести снова).
     private val failedCache = ConcurrentHashMap<String, Long>()
 
     private val WARMUP_TIMEOUT_MS = 3000L
     private val TRANSLATE_TIMEOUT_MS = 8000L
-
-    // ИЗМЕНЕНО: 3000 → 1500. Если текст вернулся к «неудачному»,
-    // повторная попытка через 1.5 сек вместо 3 сек.
     private val FAILED_RETRY_DELAY_MS = 1500L
-
     private val FAILED_CACHE_MAX = 500
 
     suspend fun prepare() {

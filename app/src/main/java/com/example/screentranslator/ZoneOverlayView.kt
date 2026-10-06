@@ -22,11 +22,6 @@ class ZoneOverlayView(context: Context) : View(context) {
     private var showTranslation: Boolean = false
     private var bgAlpha: Int = 217
 
-    /**
-     * ИЗМЕНЕНО: отступ OCR в процентах (0..50).
-     * Используется в debug-режиме для отрисовки зелёной рамки —
-     * расширенного bbox, куда попадёт crop при refine.
-     */
     private var ocrPadding: Int = 0
 
     private val boxPaint = Paint().apply {
@@ -188,11 +183,6 @@ class ZoneOverlayView(context: Context) : View(context) {
      * ИЗМЕНЕНО: в debug-режиме рисуем ДВЕ рамки:
      *   - красная — оригинальный bbox (boundingBox).
      *   - зелёная — bbox, расширенный на ocrPadding.
-     *
-     * Раньше зелёная рисовалась по initialBoundingBox (то, что было
-     * до refine), что не соответствовало текущей настройке
-     * "Отступ OCR". Теперь зелёная наглядно показывает, куда попадёт
-     * crop при refine с текущим padding.
      */
     private fun drawDebugZone(
         canvas: Canvas,

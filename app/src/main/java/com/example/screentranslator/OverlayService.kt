@@ -316,8 +316,6 @@ class OverlayService : Service(), SharedPreferences.OnSharedPreferenceChangeList
         hideZones()
 
         val view = ZoneOverlayView(this)
-        // ИЗМЕНЕНО: передаём текущий padding, чтобы в debug-режиме
-        // можно было видеть расширенный bbox.
         view.setBlocks(blocks, sourceW, sourceH, showConfidence, showTranslation,
             overlayAlpha, Settings.getOcrPadding(this))
 

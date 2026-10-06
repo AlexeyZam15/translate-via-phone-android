@@ -1,3 +1,4 @@
+// BenchmarkTranslator.kt (полный файл)
 package com.example.screentranslator
 
 import android.content.Context
@@ -23,14 +24,13 @@ import java.util.concurrent.atomic.AtomicBoolean
  * Переводчик: HTTP (CTranslate2 на ПК) + ML Kit (fallback).
  *
  * ИЗМЕНЕНО:
- *   - УБРАН второй проход ML Kit (mlkit_retry). Он дублировал работу
- *     и тратил время. Retry теперь реализован внутри OcrTranslator
- *     через failedCache с TTL.
- *   - HTTP watchdog работает, пока !httpReady, независимо от ready.
- *   - Возвращаются ТОЛЬКО переведённые пары.
- *   - ФИЛЬТР: пары, где перевод совпадает с оригиналом
- *     (Wii → Wii, Nintendo → Nintendo, EMBLEM → EMBLEM),
- *     НЕ добавляются в результат.
+ *   - УБРАНО отбрасывание пар isSameText в translateHttp. Раньше
+ *     пары типа Wii → Wii отбрасывались, из-за чего блок Wii
+ *     пропадал из оверлея. Теперь такие пары возвращаются как
+ *     есть — блок остаётся видимым.
+ *   - translateAll: merge HTTP + ML Kit сохраняет все блоки,
+ *     порядок — как в исходном списке texts.
+ *   - Возвращаются ВСЕ пары — вызывающий код сам решает, что делать.
  */
 class BenchmarkTranslator(
     private val context: Context,
@@ -138,13 +138,15 @@ class BenchmarkTranslator(
      *   2) ML Kit переводит оставшиеся блоки.
      *   3) Результаты мерджатся в LinkedHashMap (сохраняя порядок).
      *
-     * Возвращаются ТОЛЬКО переведённые пары.
-     * Повторные попытки для непереведённых блоков реализованы
-     * внутри OcrTranslator через failedCache (TTL 3 сек).
+     * Возвращаются ВСЕ пары, включая те, где перевод совпал
+     * с оригиналом (Wii → Wii). Это устраняет исчезновение блоков.
      */
     suspend fun translateAll(texts: List<String>): List<Pair<String, String>> {
         if (texts.isEmpty()) return emptyList()
-        if (!ready.get() && !httpReady.get()) return emptyList()
+        if (!ready.get() && !httpReady.get()) {
+            // Нет переводчика — возвращаем оригиналы.
+            return texts.map { it to it }
+        }
 
         DebugTimingLogger.logEvent("benchmark.start",
             mapOf("count" to texts.size, "target" to targetLang,
@@ -173,8 +175,6 @@ class BenchmarkTranslator(
         }
 
         // 2) ML Kit — для оставшихся блоков.
-        // ИЗМЕНЕНО: без второго прохода (mlkit_retry).
-        // Retry реализован внутри OcrTranslator через failedCache.
         val remaining = texts.filter { !merged.containsKey(it) }
         if (remaining.isNotEmpty() && mlkitReady.get() && mlkitTranslator.isReady()) {
             try {
@@ -195,7 +195,26 @@ class BenchmarkTranslator(
             }
         }
 
-        val result = merged.entries.map { it.key to it.value }
+        // 3) Fallback: для блоков без перевода — оставляем оригинал.
+        // ИЗМЕНЕНО: раньше такие блоки отбрасывались.
+        // Теперь Wii → Wii сохраняется, блок не пропадает.
+        for (t in texts) {
+            if (!merged.containsKey(t)) {
+                merged[t] = t
+            }
+        }
+
+        // Порядок — как в исходном списке texts.
+        val result = ArrayList<Pair<String, String>>(texts.size)
+        for (t in texts) {
+            val dst = merged[t]
+            if (dst != null && dst.isNotBlank()) {
+                result.add(t to dst)
+            } else {
+                result.add(t to t)
+            }
+        }
+
         DebugTimingLogger.logEvent("benchmark.done",
             mapOf(
                 "engines" to (if (httpReady.get()) "http+mlkit" else "mlkit"),
@@ -229,17 +248,16 @@ class BenchmarkTranslator(
                 val out = ArrayList<Pair<String, String>>()
                 for (i in 0 until minOf(transArr.length(), texts.size)) {
                     val tr = transArr.optString(i, "")
-                    if (tr.isNotBlank() && !isSameText(texts[i], tr)) {
+                    // ИЗМЕНЕНО: больше не отбрасываем пары isSameText.
+                    // Wii → Wii сохраняется, блок не пропадает.
+                    if (tr.isNotBlank()) {
                         out.add(texts[i] to tr)
                     }
+                    // Если tr пуст — не добавляем, fallback будет в translateAll.
                 }
                 out
             }
         }
-    }
-
-    private fun isSameText(original: String, translated: String): Boolean {
-        return original.trim().lowercase() == translated.trim().lowercase()
     }
 
     private suspend fun pingServer(): Boolean {
