@@ -6,16 +6,11 @@ import android.graphics.Rect
 /**
  * Работа с текстом OCR.
  *
- * ИЗМЕНЕНО:
- *   - isMeaningfulText: добавлен отсев текста с редкими символами
- *     (ş, ţ, ģ, ż, ý, þ, ð, ł, ń, ć, ę, ą, ś, ź, ğ, ı, ř, ě, ů, ž,
- *     á, é, í, ó, ú, ä, ö, ü, ß, ç, ñ, õ, ã, å, æ, ø и т.п.).
- *     Это устраняет мусор типа "AlliWihedlarşirzģar".
- *   - isMeaningfulText: добавлена проверка hasTooManyConsonants —
- *     если в слове 5+ согласных подряд, текст считается мусорным.
- *   - splitBySingleLetters: работает по elements. Одиночная
- *     заглавная буква считается разделителем ТОЛЬКО если она не
- *     примыкает вплотную к следующему element (зазор > 5px).
+ * ИЗМЕНЕНО (textsAreSimilar):
+ *   - Добавлена проверка на расстояние Левенштейна для коротких
+ *     текстов (≤ 30 символов). Если расстояние ≤ 2 — тексты похожи.
+ *     Ловит "start chapter" vs "start chaper"  (dist=1)
+ *     и     "start chapter" vs "start chapler" (dist=1).
  */
 object OcrTextNormalizer {
 
@@ -36,8 +31,6 @@ object OcrTextNormalizer {
     )
     private val LOG_REGEX = Regex("""^\[\d{2}:\d{2}:\d{2}]\s*(OCR|TR)\b""")
 
-    // ИЗМЕНЕНО: редкие символы, которые почти не встречаются
-    // в английском/русском тексте. Если их больше 2 — текст мусорный.
     private val RARE_CHARS: Set<Char> = hashSetOf(
         'ş', 'Ş', 'ţ', 'Ţ', 'ģ', 'Ģ', 'ż', 'Ż', 'ý', 'Ý',
         'þ', 'Þ', 'ð', 'Ð', 'ł', 'Ł', 'ń', 'Ń', 'ć', 'Ć',
@@ -88,6 +81,9 @@ object OcrTextNormalizer {
 
     private const val MAX_RARE_CHARS = 2
     private const val MAX_CONSECUTIVE_CONSONANTS = 5
+
+    private const val LEVENSHTEIN_MAX_DIST = 2
+    private const val LEVENSHTEIN_MAX_LEN = 30
 
     // ============================================================
     // НОРМАЛИЗАЦИЯ
@@ -158,6 +154,21 @@ object OcrTextNormalizer {
         val lb = b.trim().lowercase()
         if (la == lb) return true
 
+        val hasCyrA = la.any { it in '\u0400'..'\u04FF' }
+        val hasLatA = la.any { it in 'a'..'z' }
+        val hasCyrB = lb.any { it in '\u0400'..'\u04FF' }
+        val hasLatB = lb.any { it in 'a'..'z' }
+
+        if (hasCyrA && hasLatB) return false
+        if (hasLatA && hasCyrB) return false
+
+        if (la.length <= LEVENSHTEIN_MAX_LEN && lb.length <= LEVENSHTEIN_MAX_LEN) {
+            val dist = levenshteinDistance(la, lb)
+            if (dist <= LEVENSHTEIN_MAX_DIST) {
+                return true
+            }
+        }
+
         val minLen = minOf(la.length, lb.length)
         val maxLen = maxOf(la.length, lb.length)
         if (minLen == 0) return false
@@ -189,6 +200,38 @@ object OcrTextNormalizer {
         }
 
         return false
+    }
+
+    private fun levenshteinDistance(a: String, b: String): Int {
+        if (a == b) return 0
+        if (a.isEmpty()) return b.length
+        if (b.isEmpty()) return a.length
+
+        val s1 = if (a.length <= b.length) a else b
+        val s2 = if (a.length <= b.length) b else a
+
+        val n = s1.length
+        val m = s2.length
+
+        var prev = IntArray(n + 1) { it }
+        var curr = IntArray(n + 1)
+
+        for (j in 1..m) {
+            curr[0] = j
+            val c2 = s2[j - 1]
+            for (i in 1..n) {
+                val cost = if (s1[i - 1] == c2) 0 else 1
+                val del = prev[i] + 1
+                val ins = curr[i - 1] + 1
+                val sub = prev[i - 1] + cost
+                curr[i] = minOf(del, ins, sub)
+            }
+            val tmp = prev
+            prev = curr
+            curr = tmp
+        }
+
+        return prev[n]
     }
 
     // ============================================================
@@ -571,7 +614,6 @@ object OcrTextNormalizer {
         val n = t.length
         if (n < 3) return false
 
-        // ИЗМЕНЕНО: отсев текста с редкими символами.
         var rareCount = 0
         for (c in t) {
             if (c in RARE_CHARS) {
@@ -698,7 +740,6 @@ object OcrTextNormalizer {
                         return false
                     }
 
-                    // ИЗМЕНЕНО: отсев слов с 5+ согласными подряд.
                     if (wordIsLatin && !wordHasDigit &&
                         wordLen >= MAX_CONSECUTIVE_CONSONANTS
                     ) {
@@ -754,11 +795,6 @@ object OcrTextNormalizer {
         return true
     }
 
-    /**
-     * ИЗМЕНЕНО: проверяет, есть ли в слове 5+ согласных подряд.
-     * Например, "hedlarş" — 5 согласных подряд (h, d, l, r, ş).
-     * Такие слова — почти всегда мусор OCR.
-     */
     private fun hasTooManyConsonants(word: String): Boolean {
         var consecutive = 0
         for (c in word) {

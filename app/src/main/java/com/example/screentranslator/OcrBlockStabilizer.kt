@@ -9,13 +9,36 @@ import kotlin.math.hypot
 /**
  * Стабилизация блоков между кадрами.
  *
- * ИЗМЕНЕНО:
- *   - BBOX_SETTLE_FRAMES: 3 → 1.
- *   - POS_CHANGE_THRESHOLD: 20 → 10.
- *   - SIZE_CHANGE_THRESHOLD: 25 → 15.
- *   - STABLE_TEXT_UPDATE_THRESHOLD: 2 → 1.
- *   - Двухфазная логика bbox сохранена.
- *   - Убран detectMergeSplit.
+ * ИЗМЕНЕНО (устранение "старые блоки залипают на экране"):
+ *
+ *   1) STABLE_MISS_LIMIT уменьшен с 15 до 5 кадров (~0.8 сек при FPS 6).
+ *      Раньше блок жил 2.5 сек после исчезновения — этого хватало,
+ *      чтобы при смене меню старые пункты ("Запуск", "Запустить главу")
+ *      оставались в stableBlocks и продолжали отправляться на ПК.
+ *
+ *   2) При containment-матче (новый bbox внутри старого или наоборот)
+ *      lastSeenFrame БОЛЬШЕ НЕ ПРОДЛЕВАЕТСЯ безусловно. Продление
+ *      происходит только если текст совпадает или похож. Если в той же
+ *      геометрической зоне появился ДРУГОЙ текст — это новый UI-элемент,
+ *      а не тот же самый. Старый блок должен быть удалён через
+ *      pruneStableBlocks, а новый — добавлен как отдельный.
+ *
+ *      Раньше containment-ветка безусловно делала:
+ *          sb.lastSeenFrame = frameCounter
+ *      и старый текст ("Start Chapter") оставался в stableBlocks
+ *      даже когда на экране был уже "Select a file to continue.".
+ *
+ *   3) Добавлено диагностическое событие android.stabilizer_containment_mismatch
+ *      для отладки случаев, когда новый текст в старой зоне не совпал.
+ *
+ *   Сохранено из предыдущих версий:
+ *     - При срабатывании pendingCount >= STABLE_TEXT_UPDATE_THRESHOLD
+ *       сразу обновляется bbox из nb.boundingBox.
+ *     - В result.add(...) для сматченного stable-блока используется
+ *       sb.text вместо newText.
+ *     - STABLE_TEXT_UPDATE_THRESHOLD: 3.
+ *     - POS_CHANGE_THRESHOLD: 25, SIZE_CHANGE_THRESHOLD: 30.
+ *     - BBOX_SETTLE_FRAMES: 3, GEO_UPDATE_THRESHOLD: 3, GEO_DEAD_ZONE: 8.
  */
 object OcrBlockStabilizer {
 
@@ -24,20 +47,25 @@ object OcrBlockStabilizer {
     private const val STABLE_IOU_THRESHOLD = 0.3
     private const val CENTER_MATCH_DIST = 60.0
     private const val CONTAINMENT_MARGIN = 0.3
-    private const val STABLE_MISS_LIMIT = 15L
+    private const val STABLE_MISS_LIMIT = 5L
 
-    private const val STABLE_TEXT_UPDATE_THRESHOLD = 1
+    private const val STABLE_TEXT_UPDATE_THRESHOLD = 3
 
     private const val EVICTION_IOU = 0.3
     private const val REPLACE_IOU = 0.5
-
     private const val CONTAINMENT_MARGIN_PX = 20
 
-    private const val POS_CHANGE_THRESHOLD = 10
-    private const val SIZE_CHANGE_THRESHOLD = 15
+    private const val POS_CHANGE_THRESHOLD = 25
+    private const val SIZE_CHANGE_THRESHOLD = 30
     private const val BIG_SIZE_CHANGE_THRESHOLD = 120
 
-    private const val BBOX_SETTLE_FRAMES = 1
+    private const val BBOX_SETTLE_FRAMES = 3
+    private const val GEO_UPDATE_THRESHOLD = 3
+    private const val GEO_DEAD_ZONE = 8
+
+    private const val STABILIZER_VERSION = 6
+
+    @Volatile private var versionLogged = false
 
     data class StableBlock(
         var text: String,
@@ -49,7 +77,16 @@ object OcrBlockStabilizer {
         var pendingText: String? = null,
         var pendingCount: Int = 0,
         var bboxSettled: Boolean = true,
-        var bboxSettleCounter: Int = 0
+        var bboxSettleCounter: Int = 0,
+        var pendingDx: Int = 0,
+        var pendingDy: Int = 0,
+        var pendingDw: Int = 0,
+        var pendingDh: Int = 0,
+        var pendingGeoCount: Int = 0,
+        var pendingGeoSignDx: Int = 0,
+        var pendingGeoSignDy: Int = 0,
+        var pendingGeoSignDw: Int = 0,
+        var pendingGeoSignDh: Int = 0
     )
 
     fun stabilizeBlocks(
@@ -58,6 +95,19 @@ object OcrBlockStabilizer {
         frameCounter: Long,
         sceneChanged: Boolean
     ): List<OcrBlock> {
+        if (!versionLogged) {
+            versionLogged = true
+            DebugTimingLogger.logEvent("android.stabilizer_version",
+                mapOf(
+                    "v" to STABILIZER_VERSION,
+                    "text_update_threshold" to STABLE_TEXT_UPDATE_THRESHOLD,
+                    "pos_threshold" to POS_CHANGE_THRESHOLD,
+                    "size_threshold" to SIZE_CHANGE_THRESHOLD,
+                    "miss_limit" to STABLE_MISS_LIMIT,
+                    "fix" to "containment_no_prolong_on_text_mismatch"
+                ))
+        }
+
         if (blocks.isEmpty()) {
             pruneStableBlocks(stableBlocks, frameCounter)
             return emptyList()
@@ -135,40 +185,93 @@ object OcrBlockStabilizer {
 
             sb.lastSeenFrame = frameCounter
 
-            // ДВУХФАЗНАЯ ЛОГИКА ОБНОВЛЕНИЯ BBOX
+            // Логика обновления текста.
             if (newText == sb.text) {
                 sb.pendingText = null
                 sb.pendingCount = 0
 
                 if (sb.bboxSettled) {
-                    smoothBlockGeometry(
-                        sb,
-                        nb.boundingBox.left,
-                        nb.boundingBox.top,
-                        nb.boundingBox.width(),
-                        nb.boundingBox.height()
-                    )
+                    accumulateGeometry(sb, nb.boundingBox)
                 } else {
                     sb.bboxSettleCounter++
                     if (sb.bboxSettleCounter >= BBOX_SETTLE_FRAMES) {
                         sb.bboxSettled = true
-                        smoothBlockGeometry(
-                            sb,
-                            nb.boundingBox.left,
-                            nb.boundingBox.top,
-                            nb.boundingBox.width(),
-                            nb.boundingBox.height()
-                        )
+                        resetGeoAccumulator(sb)
+                        accumulateGeometry(sb, nb.boundingBox)
+                    }
+                }
+            } else if (OcrTextNormalizer.textsAreSimilar(sb.text, newText)) {
+                // OCR-шум — не заменяем.
+                DebugTimingLogger.logEvent("android.stabilizer_noise_skipped",
+                    mapOf(
+                        "old" to sb.text.take(60),
+                        "new" to newText.take(60)
+                    ))
+
+                sb.pendingText = null
+                sb.pendingCount = 0
+
+                if (sb.bboxSettled) {
+                    accumulateGeometry(sb, nb.boundingBox)
+                } else {
+                    sb.bboxSettleCounter++
+                    if (sb.bboxSettleCounter >= BBOX_SETTLE_FRAMES) {
+                        sb.bboxSettled = true
+                        resetGeoAccumulator(sb)
+                        accumulateGeometry(sb, nb.boundingBox)
                     }
                 }
             } else if (newText == sb.pendingText) {
                 sb.pendingCount++
                 if (sb.pendingCount >= STABLE_TEXT_UPDATE_THRESHOLD) {
+                    // При замене текста сразу обновляем bbox
+                    // из нового блока.
+                    val oldText = sb.text
+                    val oldBbox = Rect(sb.x, sb.y, sb.x + sb.w, sb.y + sb.h)
+                    val newBbox = nb.boundingBox
+
+                    val bboxChanged = (
+                            oldBbox.left != newBbox.left ||
+                                    oldBbox.top != newBbox.top ||
+                                    oldBbox.width() != newBbox.width() ||
+                                    oldBbox.height() != newBbox.height()
+                            )
+
                     sb.text = newText
+
+                    if (bboxChanged) {
+                        sb.x = newBbox.left
+                        sb.y = newBbox.top
+                        sb.w = newBbox.width()
+                        sb.h = newBbox.height()
+
+                        DebugTimingLogger.logEvent("android.stabilizer_bbox_replaced",
+                            mapOf(
+                                "text" to newText.take(60),
+                                "old_x" to oldBbox.left,
+                                "old_y" to oldBbox.top,
+                                "old_w" to oldBbox.width(),
+                                "old_h" to oldBbox.height(),
+                                "new_x" to newBbox.left,
+                                "new_y" to newBbox.top,
+                                "new_w" to newBbox.width(),
+                                "new_h" to newBbox.height()
+                            ))
+                    }
+
+                    DebugTimingLogger.logEvent("android.stabilizer_text_replaced",
+                        mapOf(
+                            "old" to oldText.take(60),
+                            "new" to newText.take(60),
+                            "pending_count" to sb.pendingCount,
+                            "bbox_changed" to bboxChanged
+                        ))
+
                     sb.pendingText = null
                     sb.pendingCount = 0
                     sb.bboxSettled = false
                     sb.bboxSettleCounter = 0
+                    resetGeoAccumulator(sb)
                 }
             } else {
                 sb.pendingText = newText
@@ -177,7 +280,7 @@ object OcrBlockStabilizer {
 
             result.add(
                 OcrBlock(
-                    text = newText,
+                    text = sb.text,
                     boundingBox = Rect(sb.x, sb.y, sb.x + sb.w, sb.y + sb.h),
                     confidence = nb.confidence,
                     initialBoundingBox = Rect(sb.x, sb.y, sb.x + sb.w, sb.y + sb.h),
@@ -208,36 +311,79 @@ object OcrBlockStabilizer {
             for (sb in stableBlocks) {
                 if (sb.w <= 0 || sb.h <= 0) continue
 
+                // Новый блок внутри старого.
                 if (isBBoxContained(
                         r.left, r.top, r.width(), r.height(),
                         sb.x, sb.y, sb.w, sb.h,
                         CONTAINMENT_MARGIN_PX
                     )
                 ) {
-                    sb.lastSeenFrame = frameCounter
-                    smoothBlockGeometry(
-                        sb,
-                        r.left, r.top, r.width(), r.height()
-                    )
+                    val textSame = (newText == sb.text)
+                    val textSimilar = OcrTextNormalizer.textsAreSimilar(sb.text, newText)
 
-                    isDuplicate = true
-                    DebugTimingLogger.logEvent("android.pc_ocr_skip_contained",
-                        mapOf(
-                            "new" to newText.take(60),
-                            "existing" to sb.text.take(60),
-                            "direction" to "new_in_stable",
-                            "refreshed" to true
-                        ))
+                    // ИЗМЕНЕНО: продлеваем lastSeenFrame ТОЛЬКО если
+                    // текст совпадает или похож. Если текст другой —
+                    // это новый UI-элемент в той же зоне, старый блок
+                    // не должен считаться "увиденным".
+                    if (textSame || textSimilar) {
+                        sb.lastSeenFrame = frameCounter
+
+                        if (textSame) {
+                            accumulateGeometry(sb, r)
+                        } else {
+                            accumulateGeometry(sb, r)
+                        }
+
+                        isDuplicate = true
+                        DebugTimingLogger.logEvent("android.pc_ocr_skip_contained",
+                            mapOf(
+                                "new" to newText.take(60),
+                                "existing" to sb.text.take(60),
+                                "direction" to "new_in_stable",
+                                "refreshed" to true
+                            ))
+                    } else {
+                        // Текст в той же зоне РАЗНЫЙ — не продлеваем.
+                        // Логируем для диагностики. Старый блок
+                        // удалится через pruneStableBlocks, если
+                        // больше не появится.
+                        DebugTimingLogger.logEvent(
+                            "android.stabilizer_containment_mismatch",
+                            mapOf(
+                                "new" to newText.take(60),
+                                "existing" to sb.text.take(60),
+                                "direction" to "new_in_stable",
+                                "action" to "no_prolong"
+                            ))
+                    }
                     break
                 }
 
+                // Старый блок внутри нового.
                 if (isBBoxContained(
                         sb.x, sb.y, sb.w, sb.h,
                         r.left, r.top, r.width(), r.height(),
                         CONTAINMENT_MARGIN_PX
                     )
                 ) {
-                    containsToRemove.add(sb)
+                    val textSame = (newText == sb.text)
+                    val textSimilar = OcrTextNormalizer.textsAreSimilar(sb.text, newText)
+
+                    // ИЗМЕНЕНО: аналогично — продлеваем только при
+                    // совпадении или похожести текста.
+                    if (textSame || textSimilar) {
+                        sb.lastSeenFrame = frameCounter
+                        containsToRemove.add(sb)
+                    } else {
+                        DebugTimingLogger.logEvent(
+                            "android.stabilizer_containment_mismatch",
+                            mapOf(
+                                "new" to newText.take(60),
+                                "existing" to sb.text.take(60),
+                                "direction" to "stable_in_new",
+                                "action" to "no_prolong"
+                            ))
+                    }
                 }
             }
 
@@ -346,6 +492,120 @@ object OcrBlockStabilizer {
         result.sortWith(compareBy({ it.boundingBox.top }, { it.boundingBox.left }))
 
         return result
+    }
+
+    private fun resetGeoAccumulator(sb: StableBlock) {
+        sb.pendingDx = 0
+        sb.pendingDy = 0
+        sb.pendingDw = 0
+        sb.pendingDh = 0
+        sb.pendingGeoCount = 0
+        sb.pendingGeoSignDx = 0
+        sb.pendingGeoSignDy = 0
+        sb.pendingGeoSignDw = 0
+        sb.pendingGeoSignDh = 0
+    }
+
+    private fun accumulateGeometry(sb: StableBlock, newBox: Rect) {
+        val dx = newBox.left - sb.x
+        val dy = newBox.top - sb.y
+        val dw = newBox.width() - sb.w
+        val dh = newBox.height() - sb.h
+
+        val dxSign = when {
+            abs(dx) < GEO_DEAD_ZONE -> 0
+            dx > 0 -> 1
+            else -> -1
+        }
+        val dySign = when {
+            abs(dy) < GEO_DEAD_ZONE -> 0
+            dy > 0 -> 1
+            else -> -1
+        }
+        val dwSign = when {
+            abs(dw) < GEO_DEAD_ZONE -> 0
+            dw > 0 -> 1
+            else -> -1
+        }
+        val dhSign = when {
+            abs(dh) < GEO_DEAD_ZONE -> 0
+            dh > 0 -> 1
+            else -> -1
+        }
+
+        if (dxSign == 0 && dySign == 0 && dwSign == 0 && dhSign == 0) {
+            resetGeoAccumulator(sb)
+            return
+        }
+
+        val sameSigns = (dxSign == 0 || dxSign == sb.pendingGeoSignDx) &&
+                (dySign == 0 || dySign == sb.pendingGeoSignDy) &&
+                (dwSign == 0 || dwSign == sb.pendingGeoSignDw) &&
+                (dhSign == 0 || dhSign == sb.pendingGeoSignDh)
+
+        if (!sameSigns) {
+            sb.pendingGeoSignDx = dxSign
+            sb.pendingGeoSignDy = dySign
+            sb.pendingGeoSignDw = dwSign
+            sb.pendingGeoSignDh = dhSign
+            sb.pendingGeoCount = 1
+            sb.pendingDx = dx
+            sb.pendingDy = dy
+            sb.pendingDw = dw
+            sb.pendingDh = dh
+            return
+        }
+
+        sb.pendingGeoSignDx = dxSign
+        sb.pendingGeoSignDy = dySign
+        sb.pendingGeoSignDw = dwSign
+        sb.pendingGeoSignDh = dhSign
+        sb.pendingGeoCount++
+        sb.pendingDx = dx
+        sb.pendingDy = dy
+        sb.pendingDw = dw
+        sb.pendingDh = dh
+
+        if (sb.pendingGeoCount >= GEO_UPDATE_THRESHOLD) {
+            applyAccumulatedGeometry(sb)
+            resetGeoAccumulator(sb)
+        }
+    }
+
+    private fun applyAccumulatedGeometry(sb: StableBlock) {
+        val dx = sb.pendingDx
+        val dy = sb.pendingDy
+        val dw = sb.pendingDw
+        val dh = sb.pendingDh
+
+        if (abs(dx) >= POS_CHANGE_THRESHOLD) {
+            sb.x += dx / 2
+        }
+        if (abs(dy) >= POS_CHANGE_THRESHOLD) {
+            sb.y += dy / 2
+        }
+
+        if (abs(dw) >= BIG_SIZE_CHANGE_THRESHOLD) {
+            sb.w = sb.w + dw
+        } else if (abs(dw) >= SIZE_CHANGE_THRESHOLD) {
+            sb.w += dw / 2
+        }
+
+        if (abs(dh) >= BIG_SIZE_CHANGE_THRESHOLD) {
+            sb.h = sb.h + dh
+        } else if (abs(dh) >= SIZE_CHANGE_THRESHOLD) {
+            sb.h += dh / 2
+        }
+    }
+
+    private fun smoothBlockGeometryImmediate(sb: StableBlock, newBox: Rect) {
+        smoothBlockGeometry(
+            sb,
+            newBox.left,
+            newBox.top,
+            newBox.width(),
+            newBox.height()
+        )
     }
 
     private fun smoothBlockGeometry(

@@ -19,7 +19,6 @@ import com.google.mlkit.nl.translate.TranslateRemoteModel
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -27,6 +26,30 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONObject
 import java.util.concurrent.TimeUnit
 
+/**
+ * ИЗМЕНЕНО (устранение циклического мерцания debug/translate):
+ *
+ *   1) УБРАН вызов loadSettingsFromPcAsync() из onCreate.
+ *      Раньше SettingsActivity при открытии делала GET /settings на ПК
+ *      и ПРИМЕНЯЛА полученные настройки локально. Если на ПК было старое
+ *      значение (например, debug=false), оно перезаписывало локальное
+ *      (debug=true), выставленное пользователем. Затем schedulePushToPc
+ *      отправлял это старое значение обратно на ПК, замыкая цикл.
+ *      Теперь синхронизация односторонняя: ПК → Android через broadcast
+ *      (SettingsReceiver). SettingsActivity только ОТОБРАЖАЕТ локальные
+ *      настройки.
+ *
+ *   2) УБРАН вызов schedulePushToPc() из onItemSelected спиннеров.
+ *      onItemSelected срабатывает не только когда пользователь выбирает
+ *      элемент, но и при ПРОГРАММНОЙ установке (spinner.setSelection).
+ *      Это приводило к ложным POST /settings на ПК.
+ *      Теперь schedulePushToPc() вызывается только:
+ *        - в checkDebug (пользователь кликает)
+ *        - в SeekBar при fromUser=true (пользователь тянет ползунок)
+ *
+ *   Метод loadSettingsFromPcAsync и applySettingsFromJson удалены
+ *   как неиспользуемые.
+ */
 class SettingsActivity : AppCompatActivity() {
 
     private lateinit var checkDebug: CheckBox
@@ -91,7 +114,6 @@ class SettingsActivity : AppCompatActivity() {
         "uk" to "Українська"
     )
 
-    // Профили качества перевода CTranslate2
     private val translateProfiles = listOf(
         "speed" to "Скорость",
         "balanced" to "Баланс",
@@ -118,7 +140,6 @@ class SettingsActivity : AppCompatActivity() {
         textModelStatus = findViewById(R.id.textModelStatus)
         btnDownloadModel = findViewById(R.id.btnDownloadModel)
 
-        // Source language
         val srcAdapter = ArrayAdapter(
             this, android.R.layout.simple_spinner_item,
             sourceLanguages.map { it.second }
@@ -126,7 +147,6 @@ class SettingsActivity : AppCompatActivity() {
         srcAdapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
         spinnerSourceLang.adapter = srcAdapter
 
-        // Target language
         val tgtAdapter = ArrayAdapter(
             this, android.R.layout.simple_spinner_item,
             targetLanguages.map { it.second }
@@ -134,7 +154,6 @@ class SettingsActivity : AppCompatActivity() {
         tgtAdapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
         spinnerTargetLang.adapter = tgtAdapter
 
-        // Translate profile
         val profAdapter = ArrayAdapter(
             this, android.R.layout.simple_spinner_item,
             translateProfiles.map { it.second }
@@ -146,8 +165,9 @@ class SettingsActivity : AppCompatActivity() {
         setupListeners()
         checkModelStatus(currentTargetLang())
 
-        // Синхронизация с ПК — забрать настройки
-        loadSettingsFromPcAsync()
+        // ИЗМЕНЕНО: loadSettingsFromPcAsync() УБРАН.
+        // Синхронизация односторонняя: ПК → Android (через broadcast).
+        // SettingsActivity только отображает локальные настройки.
     }
 
     override fun onSupportNavigateUp(): Boolean {
@@ -161,8 +181,6 @@ class SettingsActivity : AppCompatActivity() {
         pendingPushToPc?.let { uiHandler.removeCallbacks(it) }
         super.onDestroy()
     }
-
-    // ---------- Привязка значений из prefs ----------
 
     private fun bindControlsFromPrefs() {
         suppressCallbacks = true
@@ -195,8 +213,6 @@ class SettingsActivity : AppCompatActivity() {
             suppressCallbacks = false
         }
     }
-
-    // ---------- Слушатели ----------
 
     private fun setupListeners() {
         checkDebug.setOnCheckedChangeListener { _, isChecked ->
@@ -249,6 +265,10 @@ class SettingsActivity : AppCompatActivity() {
             override fun onStopTrackingTouch(sb: SeekBar?) {}
         })
 
+        // ИЗМЕНЕНО: в onItemSelected спиннеров НЕ вызываем schedulePushToPc().
+        // onItemSelected срабатывает и при ПРОГРАММНОЙ установке значения
+        // (spinner.setSelection), что приводит к ложным POST /settings на ПК.
+        // Значения, применённые программно, не должны слать POST обратно.
         spinnerSourceLang.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
             override fun onItemSelected(
                 parent: AdapterView<*>?, view: android.view.View?,
@@ -257,7 +277,7 @@ class SettingsActivity : AppCompatActivity() {
                 if (suppressCallbacks) return
                 val code = sourceLanguages[position].first ?: ""
                 Settings.setSourceLang(this@SettingsActivity, code)
-                schedulePushToPc()
+                // schedulePushToPc() НЕ вызываем — см. комментарий выше.
             }
             override fun onNothingSelected(parent: AdapterView<*>?) {}
         }
@@ -271,7 +291,7 @@ class SettingsActivity : AppCompatActivity() {
                 val code = targetLanguages[position].first
                 Settings.setTargetLang(this@SettingsActivity, code)
                 checkModelStatus(code)
-                schedulePushToPc()
+                // schedulePushToPc() НЕ вызываем.
             }
             override fun onNothingSelected(parent: AdapterView<*>?) {}
         }
@@ -284,90 +304,13 @@ class SettingsActivity : AppCompatActivity() {
                 if (suppressCallbacks) return
                 val profile = translateProfiles[position].first
                 Settings.setTranslateProfile(this@SettingsActivity, profile)
-                schedulePushToPc()
+                // schedulePushToPc() НЕ вызываем.
             }
             override fun onNothingSelected(parent: AdapterView<*>?) {}
         }
 
         btnDownloadModel.setOnClickListener {
             downloadModel(currentTargetLang())
-        }
-    }
-
-    // ---------- Синхронизация с ПК ----------
-
-    private fun loadSettingsFromPcAsync() {
-        CoroutineScope(Dispatchers.IO).launch {
-            try {
-                val endpoint = Settings.getSettingsEndpoint(this@SettingsActivity)
-                val req = Request.Builder().url(endpoint).get().build()
-                httpClient.newCall(req).execute().use { resp ->
-                    if (!resp.isSuccessful) return@launch
-                    val text = resp.body?.string() ?: return@launch
-                    val obj = JSONObject(text)
-                    withContext(Dispatchers.Main) {
-                        applySettingsFromJson(obj)
-                    }
-                }
-            } catch (_: Exception) {
-                // ПК недоступен — работаем с локальными
-            }
-        }
-    }
-
-    private fun applySettingsFromJson(obj: JSONObject) {
-        suppressCallbacks = true
-        try {
-            if (obj.has("debug")) {
-                val v = obj.optBoolean("debug", Settings.isDebug(this))
-                checkDebug.isChecked = v
-                Settings.setDebug(this, v)
-            }
-            if (obj.has("translate_profile")) {
-                val p = obj.optString("translate_profile",
-                    Settings.getTranslateProfile(this))
-                val idx = translateProfiles.indexOfFirst { it.first == p }.coerceAtLeast(0)
-                spinnerTranslateProfile.setSelection(idx)
-                Settings.setTranslateProfile(this, p)
-            }
-            if (obj.has("confidence")) {
-                val v = obj.optInt("confidence", Settings.getConfidence(this))
-                seekConfidence.progress = v
-                updateConfidenceLabel(v)
-                Settings.setConfidence(this, v)
-            }
-            if (obj.has("ocr_padding")) {
-                val v = obj.optInt("ocr_padding", Settings.getOcrPadding(this))
-                seekOcrPadding.progress = v
-                updateOcrPaddingLabel(v)
-                Settings.setOcrPadding(this, v)
-            }
-            if (obj.has("overlay_alpha")) {
-                val v = obj.optInt("overlay_alpha", Settings.getOverlayAlpha(this))
-                seekOverlayAlpha.progress = v
-                updateAlphaLabel(v)
-                Settings.setOverlayAlpha(this, v)
-            }
-            if (obj.has("source_lang")) {
-                val v = obj.optString("source_lang", Settings.getSourceLang(this))
-                val idx = sourceLanguages.indexOfFirst { (code, _) ->
-                    (code ?: "") == v
-                }.coerceAtLeast(0)
-                spinnerSourceLang.setSelection(idx)
-                Settings.setSourceLang(this, v)
-            }
-            if (obj.has("target_lang")) {
-                val v = obj.optString("target_lang", Settings.getTargetLang(this))
-                val idx = targetLanguages.indexOfFirst { it.first == v }.coerceAtLeast(0)
-                spinnerTargetLang.setSelection(idx)
-                Settings.setTargetLang(this, v)
-            }
-            if (obj.has("auto_launch_android")) {
-                Settings.setAutoLaunchAndroid(this, obj.optBoolean("auto_launch_android"))
-            }
-        } catch (_: Exception) {
-        } finally {
-            suppressCallbacks = false
         }
     }
 
@@ -402,8 +345,6 @@ class SettingsActivity : AppCompatActivity() {
             }
         }
     }
-
-    // ---------- Модель перевода ----------
 
     private fun currentTargetLang(): String {
         return targetLanguages[spinnerTargetLang.selectedItemPosition].first

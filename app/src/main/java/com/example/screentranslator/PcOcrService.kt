@@ -32,10 +32,27 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 
 /**
- * ИЗМЕНЕНО:
- *   - MIN_BLOCK_AREA = 4000. Блоки с площадью bbox меньше
- *     не отправляются на ПК. Это отсеивает мелкие "Speed:",
- *     "Max:", "Wii" и т.п.
+ * ИЗМЕНЕНО (устранение циклического мерцания debug/translate):
+ *
+ *   В onSharedPreferenceChanged при key == KEY_DEBUG теперь:
+ *     - очищается translationQueue (drain всех pending job'ов);
+ *     - сбрасываются queuedHash, queuedMode;
+ *     - сбрасываются lastSentBlocksCount, lastMode;
+ *     - сбрасываются stableBlocks, lastPreStabilizeCount.
+ *
+ *   Это гарантирует, что после переключения режима:
+ *     1) старые translate-job'ы из очереди НЕ будут обработаны и
+ *        отправлены на ПК (раньше они "догоняли" новые debug-job'ы,
+ *        вызывая мерцание оверлея на ПК);
+ *     2) следующий job сформируется с новым mode и будет отправлен
+ *        даже если набор блоков не изменился.
+ *
+ *   Ранее (сохранено):
+ *   - loadSettingsFromPc НЕ пересоздаёт benchmarkTranslator, если
+ *     targetLang и sourceLang не изменились.
+ *   - translationCache с TTL (60 секунд).
+ *   - Детекция смены сцены по количеству блоков до стабилизации.
+ *   - MIN_BLOCK_AREA = 4000.
  *   - isFragment: блок со строчной первой буквы — фрагмент
  *     только если длина < 15.
  *   - Downscale до MAX_OCR_WIDTH = 1600.
@@ -84,7 +101,11 @@ class PcOcrService : Service(), SharedPreferences.OnSharedPreferenceChangeListen
     private val stableBlocks = mutableListOf<OcrBlockStabilizer.StableBlock>()
     private var frameCounter: Long = 0L
 
-    private val translationCache = ConcurrentHashMap<String, String>()
+    @Volatile private var lastPreStabilizeCount: Int = 0
+
+    private data class CacheEntry(val value: String, val timestamp: Long)
+
+    private val translationCache = ConcurrentHashMap<String, CacheEntry>()
 
     private val debugDedup = DebugEventDedup()
 
@@ -144,6 +165,10 @@ class PcOcrService : Service(), SharedPreferences.OnSharedPreferenceChangeListen
                 .connectTimeout(1500, TimeUnit.MILLISECONDS)
                 .readTimeout(3000, TimeUnit.MILLISECONDS)
                 .build()
+
+            val oldTargetLang = targetLang
+            val oldSourceLang = sourceLang
+
             val req = Request.Builder().url(endpoint).get().build()
             kotlinx.coroutines.withContext(Dispatchers.IO) {
                 client.newCall(req).execute().use { resp ->
@@ -181,12 +206,34 @@ class PcOcrService : Service(), SharedPreferences.OnSharedPreferenceChangeListen
                 }
             }
             loadSettings()
-            scope.launch {
-                benchmarkTranslator?.close()
-                benchmarkTranslator = BenchmarkTranslator(
-                    this@PcOcrService, targetLang, sourceLang)
-                benchmarkTranslator?.prepare()
-                translationCache.clear()
+
+            val langChanged = (oldTargetLang != targetLang) ||
+                    (oldSourceLang != sourceLang)
+            if (langChanged) {
+                DebugTimingLogger.logEvent("android.benchmark_recreate_on_lang_change",
+                    mapOf(
+                        "old_target" to oldTargetLang,
+                        "new_target" to targetLang,
+                        "old_source" to (oldSourceLang ?: ""),
+                        "new_source" to (sourceLang ?: "")
+                    ))
+                Log.d(TAG, "loadSettingsFromPc: languages changed, " +
+                        "recreating benchmarkTranslator")
+                scope.launch {
+                    benchmarkTranslator?.close()
+                    benchmarkTranslator = BenchmarkTranslator(
+                        this@PcOcrService, targetLang, sourceLang)
+                    benchmarkTranslator?.prepare()
+                    translationCache.clear()
+                }
+            } else {
+                DebugTimingLogger.logEvent("android.benchmark_kept_on_settings_load",
+                    mapOf(
+                        "target" to targetLang,
+                        "source" to (sourceLang ?: "")
+                    ))
+                Log.d(TAG, "loadSettingsFromPc: languages unchanged, " +
+                        "keeping existing benchmarkTranslator")
             }
         } catch (_: Exception) {
             DebugTimingLogger.logEvent("android.settings_load_from_pc_failed")
@@ -208,25 +255,45 @@ class PcOcrService : Service(), SharedPreferences.OnSharedPreferenceChangeListen
         }
     }
 
-    private fun loadSettings() {
-        debugMode = Settings.isDebug(this)
-        val conf = Settings.getConfidence(this)
-        confidenceThreshold = conf / 100f
-        val srcRaw = Settings.getSourceLang(this)
-        sourceLang = if (srcRaw.isEmpty() || srcRaw == "auto") null else srcRaw
-        targetLang = Settings.getTargetLang(this)
-        overlayAlpha = Settings.alphaFromPercent(Settings.getOverlayAlpha(this))
-        Log.d(TAG, "loadSettings: debug=$debugMode, confidence=$conf, " +
-                "threshold=$confidenceThreshold, source=${sourceLang ?: "auto"}, " +
-                "target=$targetLang, alpha=$overlayAlpha")
+    /**
+     * ИЗМЕНЕНО: при key == KEY_DEBUG очищаем translationQueue от
+     * старых job'ов и сбрасываем все счётчики режима. Это устраняет
+     * ситуацию, когда старые translate-job'ы обрабатываются ПОСЛЕ
+     * переключения в debug и отправляют mode=translate на ПК,
+     * перезаписывая debug-оверлей (мерцание).
+     */
+    private fun drainTranslationQueue() {
+        var drained = 0
+        while (true) {
+            val result = translationQueue.tryReceive()
+            if (result.isSuccess) {
+                drained++
+            } else {
+                break
+            }
+        }
+        if (drained > 0) {
+            DebugTimingLogger.logEvent("android.pc_ocr_queue_drained",
+                mapOf("count" to drained))
+            Log.d(TAG, "translationQueue drained: $drained jobs")
+        }
     }
 
     override fun onSharedPreferenceChanged(prefs: SharedPreferences?, key: String?) {
         loadSettings()
+
         if (key == Settings.KEY_DEBUG) {
+            // ИЗМЕНЕНО: выкидываем старые job'ы из очереди,
+            // сбрасываем счётчики режима и стабилизатор.
+            drainTranslationQueue()
             stableBlocks.clear()
+            lastPreStabilizeCount = 0
             queuedHash = 0
             queuedMode = ""
+            lastSentBlocksCount = 0
+            lastMode = ""
+            DebugTimingLogger.logEvent("android.pc_ocr_debug_mode_changed",
+                mapOf("debug" to debugMode))
         }
         if (key == Settings.KEY_SOURCE_LANG || key == Settings.KEY_TARGET_LANG) {
             scope.launch {
@@ -240,14 +307,24 @@ class PcOcrService : Service(), SharedPreferences.OnSharedPreferenceChangeListen
         if (key == Settings.KEY_OCR_PADDING) {
             (ocrEngine as? MlKitOcrEngine)?.invalidateCache()
             stableBlocks.clear()
+            lastPreStabilizeCount = 0
             DebugTimingLogger.logEvent("android.pc_ocr_invalidate_on_padding")
         }
     }
 
-    /**
-     * Downscale bitmap до MAX_OCR_WIDTH перед ML Kit,
-     * после распознавания — scale bbox'ы обратно.
-     */
+    private fun loadSettings() {
+        debugMode = Settings.isDebug(this)
+        val conf = Settings.getConfidence(this)
+        confidenceThreshold = conf / 100f
+        val srcRaw = Settings.getSourceLang(this)
+        sourceLang = if (srcRaw.isEmpty() || srcRaw == "auto") null else srcRaw
+        targetLang = Settings.getTargetLang(this)
+        overlayAlpha = Settings.alphaFromPercent(Settings.getOverlayAlpha(this))
+        Log.d(TAG, "loadSettings: debug=$debugMode, confidence=$conf, " +
+                "threshold=$confidenceThreshold, source=${sourceLang ?: "auto"}, " +
+                "target=$targetLang, alpha=$overlayAlpha")
+    }
+
     private fun scaleBlocksToOriginal(
         blocks: List<OcrBlock>,
         scale: Float
@@ -328,11 +405,6 @@ class PcOcrService : Service(), SharedPreferences.OnSharedPreferenceChangeListen
                     blocks = scaleBlocksToOriginal(result.blocks, ocrScale)
                 )
 
-                val textsAfterNormalize = ArrayList<String>(fromEngine)
-                val textsAfterMeaningful = ArrayList<String>(fromEngine)
-                val textsAfterConfidence = ArrayList<String>(fromEngine)
-                val textsAfterArea = ArrayList<String>(fromEngine)
-
                 val filtered: List<OcrBlock> =
                     if (scaledResult == null || scaledResult.blocks.isEmpty()) {
                         emptyList()
@@ -342,17 +414,13 @@ class PcOcrService : Service(), SharedPreferences.OnSharedPreferenceChangeListen
                             val norm = OcrTextNormalizer.normalizeText(b.text)
                             if (norm.isEmpty()) continue
                             val normalizedBlock = b.copy(text = norm)
-                            textsAfterNormalize.add(norm)
 
                             if (!OcrTextNormalizer.isMeaningfulText(
                                     normalizedBlock.text)) continue
-                            textsAfterMeaningful.add(norm)
 
                             if (confidenceThreshold > 0f &&
                                 normalizedBlock.confidence < confidenceThreshold) continue
-                            textsAfterConfidence.add(norm)
 
-                            // ИЗМЕНЕНО: отсев мелких блоков по площади.
                             val r = normalizedBlock.boundingBox
                             val area = r.width() * r.height()
                             if (area < MIN_BLOCK_AREA) {
@@ -363,7 +431,6 @@ class PcOcrService : Service(), SharedPreferences.OnSharedPreferenceChangeListen
                                     ))
                                 continue
                             }
-                            textsAfterArea.add(norm)
 
                             out.add(normalizedBlock)
                         }
@@ -371,7 +438,6 @@ class PcOcrService : Service(), SharedPreferences.OnSharedPreferenceChangeListen
                     }
 
                 val afterFragmentFilter = ArrayList<OcrBlock>(filtered.size)
-                val textsAfterFragment = ArrayList<String>(filtered.size)
                 for (b in filtered) {
                     if (isFragment(b.text)) {
                         debugDedup.logDedup("android.pc_ocr_drop_fragment",
@@ -379,23 +445,35 @@ class PcOcrService : Service(), SharedPreferences.OnSharedPreferenceChangeListen
                         continue
                     }
                     afterFragmentFilter.add(b)
-                    textsAfterFragment.add(b.text)
                 }
 
                 val afterSplitByNumbers = ArrayList<OcrBlock>(afterFragmentFilter.size)
                 for (b in afterFragmentFilter) {
                     val splitParts = OcrTextNormalizer.splitByTextAndNumbers(b)
-                    if (splitParts.size != 1 || splitParts[0] !== b) {
-                        debugDedup.logDedup("android.pc_ocr_split_numbers",
-                            mapOf(
-                                "original" to b.text,
-                                "parts" to splitParts.map { it.text }
-                            ))
-                    }
                     for (p in splitParts) {
                         afterSplitByNumbers.add(p)
                     }
                 }
+
+                val preCount = afterSplitByNumbers.size
+                val prevCount = lastPreStabilizeCount
+                val bigDelta = kotlin.math.abs(preCount - prevCount)
+                val sceneChanged =
+                    prevCount > 0 && (
+                            preCount == 0 ||
+                                    bigDelta >= 5 ||
+                                    (preCount >= prevCount * 2) ||
+                                    (prevCount >= preCount * 2)
+                            )
+                if (sceneChanged) {
+                    DebugTimingLogger.logEvent("android.pc_ocr_scene_reset",
+                        mapOf(
+                            "prev_count" to prevCount,
+                            "new_count" to preCount
+                        ))
+                    stableBlocks.clear()
+                }
+                lastPreStabilizeCount = preCount
 
                 frameCounter++
                 val stabilized = OcrBlockStabilizer.stabilizeBlocks(
@@ -404,29 +482,6 @@ class PcOcrService : Service(), SharedPreferences.OnSharedPreferenceChangeListen
                     frameCounter = frameCounter,
                     sceneChanged = false
                 )
-
-                val pipelineLost =
-                    textsAfterNormalize.size != fromEngine ||
-                            textsAfterMeaningful.size != textsAfterNormalize.size ||
-                            textsAfterConfidence.size != textsAfterMeaningful.size ||
-                            textsAfterArea.size != textsAfterConfidence.size ||
-                            textsAfterFragment.size != textsAfterArea.size ||
-                            afterSplitByNumbers.size != textsAfterFragment.size ||
-                            stabilized.size != afterSplitByNumbers.size
-
-                if (pipelineLost) {
-                    debugDedup.logDedup("android.pc_ocr_pipeline",
-                        mapOf(
-                            "from_engine" to fromEngine,
-                            "after_normalize" to textsAfterNormalize.size,
-                            "after_meaningful" to textsAfterMeaningful.size,
-                            "after_confidence" to textsAfterConfidence.size,
-                            "after_area" to textsAfterArea.size,
-                            "after_fragment" to textsAfterFragment.size,
-                            "after_split_numbers" to afterSplitByNumbers.size,
-                            "after_stabilize" to stabilized.size
-                        ))
-                }
 
                 val job = if (scaledResult == null || stabilized.isEmpty()) {
                     if (lastSentBlocksCount > 0) {
@@ -468,10 +523,6 @@ class PcOcrService : Service(), SharedPreferences.OnSharedPreferenceChangeListen
         }
     }
 
-    /**
-     * Блок со строчной первой буквы считается фрагментом
-     * ТОЛЬКО если его длина < MIN_FRAGMENT_LENGTH = 15.
-     */
     private fun isFragment(text: String): Boolean {
         val t = text.trim()
         if (t.isEmpty()) return true
@@ -523,7 +574,7 @@ class PcOcrService : Service(), SharedPreferences.OnSharedPreferenceChangeListen
             val blockIndexByText = HashMap<String, MutableList<Int>>(job.blocks.size)
 
             for ((idx, block) in job.blocks.withIndex()) {
-                val cached = translationCache[block.text]
+                val cached = getCachedTranslation(block.text)
                 if (cached != null && cached.isNotBlank()) {
                     outBlocks[idx] = block.copy(text = cached)
                 } else {
@@ -541,7 +592,7 @@ class PcOcrService : Service(), SharedPreferences.OnSharedPreferenceChangeListen
                 for ((orig, dst) in translated) {
                     if (dst.isNotBlank()) {
                         translatedMap[orig] = dst
-                        translationCache[orig] = dst
+                        putCachedTranslation(orig, dst)
                     }
                 }
 
@@ -558,15 +609,7 @@ class PcOcrService : Service(), SharedPreferences.OnSharedPreferenceChangeListen
                     }
                 }
 
-                if (translationCache.size > TRANSLATION_CACHE_MAX) {
-                    val it = translationCache.entries.iterator()
-                    var toRemove = translationCache.size - TRANSLATION_CACHE_MAX
-                    while (it.hasNext() && toRemove > 0) {
-                        it.next()
-                        it.remove()
-                        toRemove--
-                    }
-                }
+                cleanupExpiredCache()
             }
 
             val finalBlocks = ArrayList<OcrBlock>(job.blocks.size)
@@ -592,6 +635,44 @@ class PcOcrService : Service(), SharedPreferences.OnSharedPreferenceChangeListen
             val ms = (System.nanoTime() - tStart) / 1_000_000.0
             DebugTimingLogger.logTiming("android.pc_ocr_cycle_total", ms,
                 mapOf("blocks" to blockCount, "mode" to job.mode))
+        }
+    }
+
+    private fun getCachedTranslation(text: String): String? {
+        val entry = translationCache[text] ?: return null
+        val age = System.currentTimeMillis() - entry.timestamp
+        if (age > TRANSLATION_CACHE_TTL_MS) {
+            translationCache.remove(text)
+            return null
+        }
+        return entry.value
+    }
+
+    private fun putCachedTranslation(text: String, translation: String) {
+        translationCache[text] = CacheEntry(
+            value = translation,
+            timestamp = System.currentTimeMillis()
+        )
+        if (translationCache.size > TRANSLATION_CACHE_MAX) {
+            val sorted = translationCache.entries
+                .sortedBy { it.value.timestamp }
+            var toRemove = translationCache.size - TRANSLATION_CACHE_MAX
+            for (e in sorted) {
+                if (toRemove <= 0) break
+                translationCache.remove(e.key)
+                toRemove--
+            }
+        }
+    }
+
+    private fun cleanupExpiredCache() {
+        val now = System.currentTimeMillis()
+        val it = translationCache.entries.iterator()
+        while (it.hasNext()) {
+            val e = it.next()
+            if (now - e.value.timestamp > TRANSLATION_CACHE_TTL_MS) {
+                it.remove()
+            }
         }
     }
 
@@ -654,14 +735,11 @@ class PcOcrService : Service(), SharedPreferences.OnSharedPreferenceChangeListen
         private const val NOTIFICATION_ID = 2
         const val EXTRA_ENGINE = "engine"
         private const val COORD_BUCKET = 2
-        private const val TRANSLATION_CACHE_MAX = 1000
+        private const val TRANSLATION_CACHE_MAX = 500
+        private const val TRANSLATION_CACHE_TTL_MS = 60_000L
 
         private const val MAX_OCR_WIDTH = 1600
-
         private const val MIN_FRAGMENT_LENGTH = 15
-
-        // ИЗМЕНЕНО: минимальная площадь bbox блока. Блоки меньше
-        // не отправляются на ПК. Отсеивает мелкие "Speed:", "Max:", "Wii".
         private const val MIN_BLOCK_AREA = 4000
     }
 }

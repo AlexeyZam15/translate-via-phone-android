@@ -23,14 +23,21 @@ import java.util.concurrent.atomic.AtomicBoolean
 /**
  * Переводчик: HTTP (CTranslate2 на ПК) + ML Kit (fallback).
  *
- * ИЗМЕНЕНО:
- *   - УБРАНО отбрасывание пар isSameText в translateHttp. Раньше
- *     пары типа Wii → Wii отбрасывались, из-за чего блок Wii
- *     пропадал из оверлея. Теперь такие пары возвращаются как
- *     есть — блок остаётся видимым.
- *   - translateAll: merge HTTP + ML Kit сохраняет все блоки,
- *     порядок — как в исходном списке texts.
- *   - Возвращаются ВСЕ пары — вызывающий код сам решает, что делать.
+ * ИЗМЕНЕНО (устранение регрессии "оригинал вместо перевода"):
+ *   - translateAll БОЛЬШЕ НЕ возвращает оригиналы при
+ *     !ready && !httpReady. Теперь ВСЕГДА пытается отправить
+ *     в translateHttp — если HTTP-сервер доступен, перевод пройдёт,
+ *     даже если флаг httpReady не обновился.
+ *   - translateHttp при успехе ставит httpReady = true.
+ *   - translateAll: если HTTP вернул пустой результат и
+ *     httpReady == false, делает одну повторную попытку
+ *     (ping + translate).
+ *   - pingServer при успехе ставит httpReady = true.
+ *
+ *   Ранее:
+ *     - УБРАНО отбрасывание пар isSameText в translateHttp.
+ *     - translateAll: merge HTTP + ML Kit сохраняет все блоки.
+ *     - Fallback: для блоков без перевода — оставляем оригинал.
  */
 class BenchmarkTranslator(
     private val context: Context,
@@ -132,21 +139,17 @@ class BenchmarkTranslator(
     fun isHttpReady(): Boolean = httpReady.get()
 
     /**
-     * Мерджит результаты HTTP и ML Kit.
+     * ИЗМЕНЕНО: БОЛЬШЕ НЕ возвращает оригиналы при !ready && !httpReady.
      *
-     *   1) HTTP переводит всё, что может.
-     *   2) ML Kit переводит оставшиеся блоки.
-     *   3) Результаты мерджатся в LinkedHashMap (сохраняя порядок).
+     * Теперь ВСЕГДА пытается отправить в translateHttp. Если HTTP-сервер
+     * доступен — перевод пройдёт, даже если флаг httpReady не обновился
+     * (например, benchmarkTranslator был пересоздан и не успел прогреться).
      *
-     * Возвращаются ВСЕ пары, включая те, где перевод совпал
-     * с оригиналом (Wii → Wii). Это устраняет исчезновение блоков.
+     * Если HTTP вернул пустой результат и httpReady == false —
+     * делаем одну повторную попытку (ping + translate).
      */
     suspend fun translateAll(texts: List<String>): List<Pair<String, String>> {
         if (texts.isEmpty()) return emptyList()
-        if (!ready.get() && !httpReady.get()) {
-            // Нет переводчика — возвращаем оригиналы.
-            return texts.map { it to it }
-        }
 
         DebugTimingLogger.logEvent("benchmark.start",
             mapOf("count" to texts.size, "target" to targetLang,
@@ -154,27 +157,59 @@ class BenchmarkTranslator(
 
         val merged = LinkedHashMap<String, String>()
 
-        // 1) HTTP — если готов.
-        if (httpReady.get()) {
+        // 1) HTTP — ВСЕГДА пытаемся, даже если httpReady == false.
+        //    Если сервер доступен — перевод пройдёт.
+        var httpResult = emptyList<Pair<String, String>>()
+        try {
+            val t0 = System.nanoTime()
+            httpResult = translateHttp(texts)
+            val ms = (System.nanoTime() - t0) / 1_000_000.0
+            DebugTimingLogger.logTiming("benchmark.http", ms,
+                mapOf("count" to texts.size, "got" to httpResult.size))
+            for ((src, dst) in httpResult) {
+                if (!merged.containsKey(src)) {
+                    merged[src] = dst
+                }
+            }
+            // Успешный HTTP — обновляем флаг.
+            if (httpResult.isNotEmpty()) {
+                if (!httpReady.get()) {
+                    httpReady.set(true)
+                    ready.set(true)
+                    DebugTimingLogger.logEvent("benchmark.http_became_ready_on_translate")
+                }
+            }
+        } catch (t: Throwable) {
+            Log.w(tag, "HTTP failed: ${t.message}")
+            DebugTimingLogger.logEvent("benchmark.http_error",
+                mapOf("error" to (t.message ?: "")))
+        }
+
+        // 2) Если HTTP вернул пустой результат и httpReady == false —
+        //    одна повторная попытка (ping + translate).
+        if (httpResult.isEmpty() && !httpReady.get()) {
             try {
-                val t0 = System.nanoTime()
-                val httpResult = translateHttp(texts)
-                val ms = (System.nanoTime() - t0) / 1_000_000.0
-                DebugTimingLogger.logTiming("benchmark.http", ms,
-                    mapOf("count" to texts.size))
-                for ((src, dst) in httpResult) {
-                    if (!merged.containsKey(src)) {
-                        merged[src] = dst
+                val ok = pingServer()
+                if (ok) {
+                    httpReady.set(true)
+                    ready.set(true)
+                    val t0 = System.nanoTime()
+                    httpResult = translateHttp(texts)
+                    val ms = (System.nanoTime() - t0) / 1_000_000.0
+                    DebugTimingLogger.logTiming("benchmark.http_retry", ms,
+                        mapOf("count" to texts.size, "got" to httpResult.size))
+                    for ((src, dst) in httpResult) {
+                        if (!merged.containsKey(src)) {
+                            merged[src] = dst
+                        }
                     }
                 }
             } catch (t: Throwable) {
-                Log.w(tag, "HTTP failed: ${t.message}")
-                DebugTimingLogger.logEvent("benchmark.http_error",
-                    mapOf("error" to (t.message ?: "")))
+                Log.w(tag, "HTTP retry failed: ${t.message}")
             }
         }
 
-        // 2) ML Kit — для оставшихся блоков.
+        // 3) ML Kit — для оставшихся блоков.
         val remaining = texts.filter { !merged.containsKey(it) }
         if (remaining.isNotEmpty() && mlkitReady.get() && mlkitTranslator.isReady()) {
             try {
@@ -195,9 +230,7 @@ class BenchmarkTranslator(
             }
         }
 
-        // 3) Fallback: для блоков без перевода — оставляем оригинал.
-        // ИЗМЕНЕНО: раньше такие блоки отбрасывались.
-        // Теперь Wii → Wii сохраняется, блок не пропадает.
+        // 4) Fallback: для блоков без перевода — оставляем оригинал.
         for (t in texts) {
             if (!merged.containsKey(t)) {
                 merged[t] = t
@@ -219,7 +252,8 @@ class BenchmarkTranslator(
             mapOf(
                 "engines" to (if (httpReady.get()) "http+mlkit" else "mlkit"),
                 "translated" to result.size,
-                "total" to texts.size
+                "total" to texts.size,
+                "http_got" to httpResult.size
             ))
         return result
     }
@@ -248,12 +282,9 @@ class BenchmarkTranslator(
                 val out = ArrayList<Pair<String, String>>()
                 for (i in 0 until minOf(transArr.length(), texts.size)) {
                     val tr = transArr.optString(i, "")
-                    // ИЗМЕНЕНО: больше не отбрасываем пары isSameText.
-                    // Wii → Wii сохраняется, блок не пропадает.
                     if (tr.isNotBlank()) {
                         out.add(texts[i] to tr)
                     }
-                    // Если tr пуст — не добавляем, fallback будет в translateAll.
                 }
                 out
             }
